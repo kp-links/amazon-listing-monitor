@@ -1,24 +1,45 @@
 name: amazon-cart-monitor
 
-# 15分毎の起動は外部cron(cron-job.org)→workflow_dispatch APIで行う（GitHub内蔵cronは遅延/スキップが酷く15分を満たせないため不使用）。
+# 確実な15分間隔は「1ジョブ内で15分sleepループ（約5.5h）」で担保する。
+# GitHub内蔵cronは遅延/スキップが大きく単発では15分を満たせないため、cronは
+# あくまで“次のループ実行を起動するためのハートビート”として使い、concurrencyで
+# 連鎖させる（前のループ終了時に保留中のrunが即開始＝途切れない）。public repoは
+# Actions実行枠が無制限なので長時間ループも無料。外部cron/PATは不要。
 on:
+  schedule:
+    - cron: "*/15 * * * *"   # チェーン用ハートビート（実15分間隔はジョブ内ループ）
   workflow_dispatch: {}
+
+permissions:
+  contents: write             # keep-alive コミット用（60日無活動でのschedule自動停止を回避）
 
 concurrency:
   group: cart-monitor
-  cancel-in-progress: false
+  cancel-in-progress: false   # 実行中は新runを保留→終了時に即開始（連続カバー）
 
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 14
+    timeout-minutes: 340       # 約5h40m（GitHubのジョブ上限6hの手前）
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - name: Run monitor
+
+      - name: Keep-alive (avoid 60-day schedule disable)
+        run: |
+          git config user.name "cart-monitor-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          last=$(cat .heartbeat 2>/dev/null || echo 0)
+          nowdays=$(( $(date +%s) / 86400 ))
+          if [ $((nowdays - last)) -ge 14 ]; then
+            echo "$nowdays" > .heartbeat
+            git add .heartbeat && git commit -m "chore: keep-alive" && git push || true
+          fi
+
+      - name: Monitor loop (every 15min for ~5.5h)
         env:
           SPAPI_REFRESH_TOKEN: ${{ secrets.SPAPI_REFRESH_TOKEN }}
           SPAPI_LWA_CLIENT_ID: ${{ secrets.SPAPI_LWA_CLIENT_ID }}
@@ -30,4 +51,17 @@ jobs:
           CHATWORK_ROOM_ID: ${{ secrets.CHATWORK_ROOM_ID }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-        run: python monitor.py
+        run: |
+          END=$((SECONDS + 19800))   # 5h30m まで回す
+          i=0
+          while :; do
+            i=$((i+1)); T0=$SECONDS
+            echo "::group::cycle $i ($(date -u +%H:%M:%SZ))"
+            python monitor.py || echo "monitor exited nonzero (continuing)"
+            echo "::endgroup::"
+            # 次サイクルが時間内に収まらなければ終了（保留中の次runが連鎖起動）
+            [ $((SECONDS + 900)) -ge $END ] && break
+            WAIT=$((900 - (SECONDS - T0))); [ $WAIT -lt 0 ] && WAIT=0
+            sleep $WAIT
+          done
+          echo "loop done: $i cycles"
