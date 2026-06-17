@@ -1,0 +1,33 @@
+name: amazon-cart-monitor
+
+# 15分毎の起動は外部cron(cron-job.org)→workflow_dispatch APIで行う（GitHub内蔵cronは遅延/スキップが酷く15分を満たせないため不使用）。
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: cart-monitor
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run monitor
+        env:
+          SPAPI_REFRESH_TOKEN: ${{ secrets.SPAPI_REFRESH_TOKEN }}
+          SPAPI_LWA_CLIENT_ID: ${{ secrets.SPAPI_LWA_CLIENT_ID }}
+          SPAPI_LWA_CLIENT_SECRET: ${{ secrets.SPAPI_LWA_CLIENT_SECRET }}
+          SPAPI_MARKETPLACE_ID: ${{ secrets.SPAPI_MARKETPLACE_ID }}
+          SPAPI_HOST: ${{ secrets.SPAPI_HOST }}
+          OWN_SELLER_ID: ${{ secrets.OWN_SELLER_ID }}
+          CHATWORK_TOKEN: ${{ secrets.CHATWORK_TOKEN }}
+          CHATWORK_ROOM_ID: ${{ secrets.CHATWORK_ROOM_ID }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: python monitor.py
