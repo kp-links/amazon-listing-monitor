@@ -1,0 +1,5 @@
+*.env
+streamlit_cloud_secrets.toml
+credentials*.json
+data/*.csv
+.streamlit/secrets.toml
