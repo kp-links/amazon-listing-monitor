@@ -242,7 +242,8 @@ def main() -> int:
     #    cron が遅延しても開始境界が深夜0時で固定され、境界日の出入りを抑える。
     now = datetime.now(JST)
     today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_iso = (today0 - timedelta(days=WINDOW_DAYS - 1)).isoformat(timespec="seconds")
+    start_dt = today0 - timedelta(days=WINDOW_DAYS - 1)
+    start_iso = start_dt.isoformat(timespec="seconds")
     end_iso = now.isoformat(timespec="seconds")
     sp_token = lwa_token()
     print(f"[info] 注文レポート取得 {start_iso} 〜 {end_iso}")
@@ -281,7 +282,8 @@ def main() -> int:
         else:
             col_c.append([""])              # ASIN無し行は触らない
 
-    stamp = f"直近30日販売数(更新 {now.strftime('%Y/%m/%d %H:%M')} JST)"
+    stamp = (f"直近30日販売数 ｜ 集計期間 {start_dt:%Y/%m/%d}〜{now:%Y/%m/%d}"
+             f"(注文日ベース) ｜ 更新 {now:%Y/%m/%d %H:%M} JST")
     sheet_update(gtok, sheet_id, _a1(title, "C1"), [[stamp]])
     if col_c:
         last_row = 1 + len(col_c)           # C2..C{last}
