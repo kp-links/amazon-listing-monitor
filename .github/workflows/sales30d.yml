@@ -1,0 +1,40 @@
+name: amazon-sales-30d
+
+# 悩み解決ラボ：直近30日の販売数量(ASIN別)を管理シートのC列へ毎朝書き込む。
+# GitHub内蔵cronは数分遅延しうるが、日次1回の集計用途では許容範囲。
+# 同リポジトリの cart-monitor が14日毎に keep-alive コミットするため、
+# 60日無活動による schedule 自動停止は回避済み（本ワークフロー専用の対策は不要）。
+on:
+  schedule:
+    - cron: "0 23 * * *"      # UTC 23:00 = JST 08:00
+  workflow_dispatch: {}        # 手動実行（初回検証用）
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sales-30d
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+
+      - name: Extract 30-day sales quantity and write to sheet
+        env:
+          SPAPI_REFRESH_TOKEN: ${{ secrets.SPAPI_REFRESH_TOKEN }}
+          SPAPI_LWA_CLIENT_ID: ${{ secrets.SPAPI_LWA_CLIENT_ID }}
+          SPAPI_LWA_CLIENT_SECRET: ${{ secrets.SPAPI_LWA_CLIENT_SECRET }}
+          SPAPI_MARKETPLACE_ID: ${{ secrets.SPAPI_MARKETPLACE_ID }}
+          SPAPI_HOST: ${{ secrets.SPAPI_HOST }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SALES_SHEET_ID: ${{ secrets.SALES_SHEET_ID }}
+          SALES_SHEET_GID: "1707721264"
+        run: python sales30d.py
