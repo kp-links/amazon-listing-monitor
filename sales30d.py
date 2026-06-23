@@ -229,6 +229,35 @@ def sheet_update(token: str, sheet_id: str, rng: str, values: list[list]) -> Non
                  params={"valueInputOption": "RAW"}, body={"values": values})
 
 
+def set_c1(token: str, sheet_id: str, gid: int, text: str, *, alert: bool) -> None:
+    """C1 に値＋書式をまとめて設定（batchUpdate）。
+    alert=True で赤字・太字・薄赤背景（更新エラーを一目で示す）。
+    alert=False は黒字・通常・白背景に戻す（成功時に前回の赤を自己回復で消す）。"""
+    red = {"red": 0.8, "green": 0.0, "blue": 0.0}
+    black = {"red": 0.0, "green": 0.0, "blue": 0.0}
+    light_red = {"red": 1.0, "green": 0.85, "blue": 0.85}
+    white = {"red": 1.0, "green": 1.0, "blue": 1.0}
+    fmt = {
+        "textFormat": {"bold": alert, "foregroundColor": red if alert else black},
+        "backgroundColor": light_red if alert else white,
+    }
+    _sheets_call("POST", token, sheet_id, ":batchUpdate", body={"requests": [{
+        "updateCells": {
+            "range": {"sheetId": gid, "startRowIndex": 0, "endRowIndex": 1,
+                      "startColumnIndex": 2, "endColumnIndex": 3},
+            "rows": [{"values": [{
+                "userEnteredValue": {"stringValue": text},
+                "userEnteredFormat": fmt,
+            }]}],
+            # 既存のフォント種別/サイズを消さないよう bold/文字色/背景のみに限定
+            "fields": ("userEnteredValue,"
+                       "userEnteredFormat.textFormat.bold,"
+                       "userEnteredFormat.textFormat.foregroundColor,"
+                       "userEnteredFormat.backgroundColor"),
+        }
+    }]})
+
+
 def main() -> int:
     sheet_id = _env("SALES_SHEET_ID")
     gid_raw = _env("SALES_SHEET_GID")
@@ -237,59 +266,73 @@ def main() -> int:
     except ValueError:
         sys.exit(f"[FATAL] SALES_SHEET_GID が整数でない: '{gid_raw}'")
 
-    # 1) SP-API：直近30日の注文を取得し ASIN 別数量を集計
-    #    窓は JST 暦日基準（本日含む直近30日 = [本日-29日 00:00, 現在]）。
-    #    cron が遅延しても開始境界が深夜0時で固定され、境界日の出入りを抑える。
     now = datetime.now(JST)
     today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
     start_dt = today0 - timedelta(days=WINDOW_DAYS - 1)
     start_iso = start_dt.isoformat(timespec="seconds")
     end_iso = now.isoformat(timespec="seconds")
-    sp_token = lwa_token()
-    print(f"[info] 注文レポート取得 {start_iso} 〜 {end_iso}")
-    tsv = fetch_orders_tsv(sp_token, start_iso, end_iso)
-    totals = sum_quantity_by_asin(tsv)
-    print(f"[info] 集計対象ASIN数={len(totals)} 総数量={sum(totals.values())}")
-    if not totals:
-        # 直近30日で1件も取れない＝取得異常の可能性。C列の既存値を消さず中止。
-        sys.exit("[FATAL] 集計結果が空（取得異常の可能性）→ C列を保全し書込まず中止")
 
-    # 2) Sheets：A列ASINを正本に、各行のC列へ数量を書く
+    # 1) 先に Sheets を確定（認証→gid解決→A:B読込→ヘッダ検証）。
+    #    これで「対象シートが正しい」ことを保証してから SP-API を叩くため、
+    #    以降の失敗時は安心して C1 にエラーアラートを書ける。
+    #    ※ここで落ちる＝シート認証/共有/設定の問題でアラート自体書けない→GitHub失敗メールで検知。
     gtok = sheets_token()
     title = resolve_sheet_title(gtok, sheet_id, gid)
     rows = sheet_read(gtok, sheet_id, _a1(title, "A1:B"))
     if not rows:
         sys.exit("[FATAL] 対象シートのA:B列が空（gid/共有設定を確認）")
-
-    # ヘッダ検証：誤ったシートへC列を破壊上書きしないための硬ゲート。
-    # A1 に ASIN（例 "(子) ASIN"）、B1 に SKU を期待する。
+    # ヘッダ検証：誤ったシートへC列を破壊上書きしないための硬ゲート（A1=ASIN, B1=SKU）。
     a1 = (rows[0][0] if rows[0] else "").strip()
     b1 = (rows[0][1] if len(rows[0]) > 1 else "").strip()
     if "ASIN" not in a1.upper() or "SKU" not in b1.upper():
         sys.exit(f"[FATAL] ヘッダ不一致 A1='{a1}' B1='{b1}'（ASIN/SKU を期待）。"
                  "対象シート(gid)を誤っている可能性→中止")
 
-    # 3) C列の値を行順に組み立て（A列にASINがある行のみ数量、無い行は空のまま温存）
-    col_c: list[list] = []
-    matched = 0
-    for r in rows[1:]:                      # 2行目以降
-        asin = (r[0].strip() if r and len(r) > 0 and r[0] else "")
-        if asin and asin in totals:
-            col_c.append([totals[asin]])
-            matched += 1
-        elif asin:
-            col_c.append([0])               # 出品はあるが30日販売ゼロ
-        else:
-            col_c.append([""])              # ASIN無し行は触らない
+    # 2) SP-API集計→C列書込み。失敗したら C1 に赤字アラートを出し、数値(C2:C)は保全。
+    try:
+        sp_token = lwa_token()
+        print(f"[info] 注文レポート取得 {start_iso} 〜 {end_iso}")
+        tsv = fetch_orders_tsv(sp_token, start_iso, end_iso)
+        totals = sum_quantity_by_asin(tsv)
+        print(f"[info] 集計対象ASIN数={len(totals)} 総数量={sum(totals.values())}")
+        if not totals:
+            raise RuntimeError("集計結果が空（取得異常の可能性）")
 
-    stamp = (f"直近30日販売数 ｜ 集計期間 {start_dt:%Y/%m/%d}〜{now:%Y/%m/%d}"
-             f"(注文日ベース) ｜ 更新 {now:%Y/%m/%d %H:%M} JST")
-    sheet_update(gtok, sheet_id, _a1(title, "C1"), [[stamp]])
-    if col_c:
-        last_row = 1 + len(col_c)           # C2..C{last}
-        sheet_update(gtok, sheet_id, _a1(title, f"C2:C{last_row}"), col_c)
-    print(f"[ok] 書込み完了 シート='{title}' 行数={len(col_c)} 一致ASIN={matched}")
-    return 0
+        col_c: list[list] = []
+        matched = 0
+        for r in rows[1:]:                      # 2行目以降
+            asin = (r[0].strip() if r and len(r) > 0 and r[0] else "")
+            if asin and asin in totals:
+                col_c.append([totals[asin]])
+                matched += 1
+            elif asin:
+                col_c.append([0])               # 出品はあるが30日販売ゼロ
+            else:
+                col_c.append([""])              # ASIN無し行は触らない
+
+        stamp = (f"直近30日販売数 ｜ 集計期間 {start_dt:%Y/%m/%d}〜{now:%Y/%m/%d}"
+                 f"(注文日ベース) ｜ 更新 {now:%Y/%m/%d %H:%M} JST")
+        if col_c:
+            last_row = 1 + len(col_c)           # 先にC2:C（本体）→最後にC1（成功印）
+            sheet_update(gtok, sheet_id, _a1(title, f"C2:C{last_row}"), col_c)
+        set_c1(gtok, sheet_id, gid, stamp, alert=False)   # 黒字に戻す＝前回の赤を解除
+        print(f"[ok] 書込み完了 シート='{title}' 行数={len(col_c)} 一致ASIN={matched}")
+        return 0
+    except Exception as e:
+        # 更新エラー：C1 を赤字アラート化（C2:C の数値は触らず古い値を保全）。
+        detail = f"{type(e).__name__}: {str(e)[:140]}"
+        print(f"[FATAL] 更新失敗 → C1にアラート記載: {detail}")
+        try:
+            prev = sheet_read(gtok, sheet_id, _a1(title, "C1"))
+            prevtxt = (prev[0][0].strip() if prev and prev[0] else "")
+            tail = (f"（前回成功: {prevtxt}）"
+                    if prevtxt and "更新エラー" not in prevtxt else "")
+            alert = (f"⚠️更新エラー {now:%Y/%m/%d %H:%M} JST：{detail}"
+                     f"／C列は前回値のまま（古い可能性）{tail}")
+            set_c1(gtok, sheet_id, gid, alert, alert=True)
+        except Exception as e2:
+            print(f"[warn] アラート書込みも失敗（GitHub失敗メールで検知を）: {e2}")
+        raise   # 非ゼロ終了＝GitHub失敗メールも発火
 
 
 if __name__ == "__main__":
