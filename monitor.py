@@ -55,10 +55,24 @@ BAD = {
 }
 
 
+# 監視対象の会社（テナント）。argv[1] で指定。空＝従来の無印secrets（悩み解決ラボ互換）。
+_TENANT = ""
+
+
 def _env(name: str, required: bool = True) -> str:
-    v = os.getenv(name, "")
+    """環境変数を読む。会社別運用では `<NAME>_<TENANT>` を優先し、無ければ無印にフォールバック。
+
+    例: _TENANT="nature" → SPAPI_REFRESH_TOKEN_NATURE があればそれ、無ければ SPAPI_REFRESH_TOKEN。
+    lwa_client_id/secret・marketplace・host・chatwork_token・SA_JSON は全社共通＝無印を流用。
+    """
+    v = ""
+    if _TENANT:
+        v = os.getenv(f"{name}_{_TENANT.upper()}", "")
+    if not v:
+        v = os.getenv(name, "")
     if required and not v:
-        sys.exit(f"[FATAL] 環境変数 {name} が未設定")
+        suffix = f"（または {name}_{_TENANT.upper()}）" if _TENANT else ""
+        sys.exit(f"[FATAL] 環境変数 {name}{suffix} が未設定")
     return v
 
 
@@ -273,6 +287,10 @@ def chatwork_post(message: str) -> None:
 
 # ── メイン ────────────────────────────────────────────────────────────────
 def main() -> int:
+    global _TENANT
+    _TENANT = (sys.argv[1].strip() if len(sys.argv) > 1 else "")
+    if _TENANT:
+        print(f"=== カート監視 tenant={_TENANT} ===")
     own_seller = _env("OWN_SELLER_ID")
     sheet_id = _env("SHEET_ID")
     gtok = sheets_service_token()

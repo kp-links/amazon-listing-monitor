@@ -51,13 +51,25 @@ jobs:
           CHATWORK_ROOM_ID: ${{ secrets.CHATWORK_ROOM_ID }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
+          # 会社別（ナチュレ / Qiera）。lwa/marketplace/host/chatwork_token/SA は上の無印を共通流用。
+          SPAPI_REFRESH_TOKEN_NATURE: ${{ secrets.SPAPI_REFRESH_TOKEN_NATURE }}
+          OWN_SELLER_ID_NATURE: ${{ secrets.OWN_SELLER_ID_NATURE }}
+          CHATWORK_ROOM_ID_NATURE: ${{ secrets.CHATWORK_ROOM_ID_NATURE }}
+          SHEET_ID_NATURE: ${{ secrets.SHEET_ID_NATURE }}
+          SPAPI_REFRESH_TOKEN_QIERA: ${{ secrets.SPAPI_REFRESH_TOKEN_QIERA }}
+          OWN_SELLER_ID_QIERA: ${{ secrets.OWN_SELLER_ID_QIERA }}
+          CHATWORK_ROOM_ID_QIERA: ${{ secrets.CHATWORK_ROOM_ID_QIERA }}
+          SHEET_ID_QIERA: ${{ secrets.SHEET_ID_QIERA }}
         run: |
           END=$((SECONDS + 19800))   # 5h30m まで回す
           i=0
           while :; do
             i=$((i+1)); T0=$SECONDS
             echo "::group::cycle $i ($(date -u +%H:%M:%SZ))"
-            python monitor.py || echo "monitor exited nonzero (continuing)"
+            for T in thirdknowledge nature qiera; do
+              echo "--- tenant $T ---"
+              python monitor.py "$T" || echo "monitor[$T] exited nonzero (continuing)"
+            done
             echo "::endgroup::"
             # 次サイクルが時間内に収まらなければ終了（保留中の次runが連鎖起動）
             [ $((SECONDS + 900)) -ge $END ] && break
