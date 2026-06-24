@@ -1,0 +1,42 @@
+name: amazon-sales-30d-qiera
+
+# Qiera（ディアスリー）：直近30日の販売数量(ASIN別)を管理シート「Amazon販売数管理」のC列へ毎朝書き込む。
+# 本体スクリプト(sales30d.py)は悩み解決ラボ・ナチュレと共通。差分は env のみ：
+#   - SP-API refresh_token  … Qiera口座(SPAPI_REFRESH_TOKEN_QIERA)
+#   - LWA app / marketplace / host … 他社と同一アプリのため共有 secret を流用
+#   - 対象シート            … SALES_SHEET_ID_QIERA / gid=1265374618
+# keep-alive は同リポの cart-monitor が担うため本ワークフロー専用対策は不要。
+on:
+  schedule:
+    - cron: "10 23 * * *"      # UTC 23:10 = JST 08:10（他社ジョブと数分ずらし同時集中を回避）
+  workflow_dispatch: {}         # 手動実行（初回検証用）
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sales-30d-qiera
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+
+      - name: Extract 30-day sales quantity (Qiera) and write to sheet
+        env:
+          SPAPI_REFRESH_TOKEN: ${{ secrets.SPAPI_REFRESH_TOKEN_QIERA }}
+          SPAPI_LWA_CLIENT_ID: ${{ secrets.SPAPI_LWA_CLIENT_ID }}
+          SPAPI_LWA_CLIENT_SECRET: ${{ secrets.SPAPI_LWA_CLIENT_SECRET }}
+          SPAPI_MARKETPLACE_ID: ${{ secrets.SPAPI_MARKETPLACE_ID }}
+          SPAPI_HOST: ${{ secrets.SPAPI_HOST }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SALES_SHEET_ID: ${{ secrets.SALES_SHEET_ID_QIERA }}
+          SALES_SHEET_GID: "1265374618"
+        run: python sales30d.py
