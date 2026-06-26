@@ -14,7 +14,12 @@ name: inventory-alert-nature
 on:
   schedule:
     - cron: "30 0 * * 1,3,5"    # UTC 00:30 = JST 09:30（08:05の販売数更新後）
-  workflow_dispatch: {}          # 手動実行（初回検証・サンプル生成用）
+  workflow_dispatch:             # 手動実行（初回検証・サンプル生成用）
+    inputs:
+      send_chatwork:
+        description: "Chatworkに投稿する(true) / シートだけ更新(false)"
+        type: boolean
+        default: false           # 手動実行は既定でシートのみ（誤投稿防止）
 
 permissions:
   contents: read
@@ -49,4 +54,10 @@ jobs:
           # cart-monitor用 CHATWORK_ROOM_ID_NATURE と切り離した専用Secretを使う。
           # ※ GitHub に CHATWORK_ROOM_ID_NATURE_INV = 393394277 を登録すること。
           CHATWORK_ROOM_ID: ${{ secrets.CHATWORK_ROOM_ID_NATURE_INV }}
-        run: python inventory_alert.py
+        # スケジュール実行は常に投稿。手動実行は send_chatwork=true の時だけ投稿。
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.send_chatwork }}" != "true" ]; then
+            python inventory_alert.py --no-chatwork
+          else
+            python inventory_alert.py
+          fi
