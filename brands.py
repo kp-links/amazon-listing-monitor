@@ -8,7 +8,10 @@ SP-API refresh token）は環境変数で注入し、ここには置かない。
 
 ⚠️ フォーマット列マップはブランドごとに実シートで実地検証してから追加すること。
    悩み解決ラボはマイクロアルジェ仕入の在庫列が増えるためナチュレと列順が違う。
-   （2026-06-26 ナチュレのみ検証済。labo/qiera は実シート確認後に追記）
+   （2026-06-26 ナチュレ検証済。2026-06-29 labo[フォーマットv2]/qiera[フォーマット]
+     を実シート実地検証して追加。labo=マイクロアルジェ列(H,I)増設で自社以降がズレ、
+     qiera=ラベル列なしで sku_comment が AM。ココ7d/30d は labo=RSL売上状況/
+     qiera=NE売上状況 タブ。両者とも列構造は同一[sku=D,7d=E,30d=F,データ3行目開始]。）
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -53,6 +56,46 @@ NATURE_FORMAT_COLS = {
 # ※ Amazon ではない。Amazon の 7d/30d は SP-API から取得する。
 NATURE_NE_COLS = {"sku": 3, "coco_7d": 4, "coco_30d": 5}
 
+# 悩み解決ラボ「フォーマットv2」(gid=1674969562)。マイクロアルジェ在庫(H,I)が増設
+# され、ナチュレ比で自社(J)以降が右に2列ずれる。直近販売数=L(総)/M(Amazon)/N(ココ)。
+LABO_FORMAT_COLS = {
+    "product": 0, "size": 1, "asin": 2, "sku": 3,
+    "stock_total": 4, "stock_fba": 5, "stock_coco": 6,
+    # H=マイクロアルジェAmazon在庫 / I=マイクロアルジェ楽天在庫（在庫日数計算には不使用）
+    "stock_own": 9,
+    "requested_qty": 10,
+    "sales_total": 11, "sales_amazon": 12, "sales_coco": 13,
+    "days_total": 14, "days_amazon": 15, "days_coco": 16,
+    "stockout_total": 17, "stockout_amazon": 18, "stockout_coco": 19,
+    "delivery_deadline": 20, "repeat_order_deadline": 21,
+    "alert_order": 22, "alert_fba": 23, "alert_coco": 24, "alert_done": 25,
+    "lot_current": 26, "lot_ordered": 27, "delivery_plan": 28, "order_lot": 29,
+    "new_lot_assign": 30, "aerologi": 31, "set_assembly": 32, "order_consider": 33,
+    "amazon_todo_date": 34, "amazon_todo": 35, "amazon_todo_qty": 36,
+    "coco_todo_date": 37, "coco_todo": 38, "coco_todo_qty": 39,
+    "sku_comment": 40,
+}
+# Qiera「フォーマット」(gid=1674969562)。ナチュレ同型だが「ラベル」列が無く、
+# 新ロット振り分け以降が1列詰まる。sku_comment は AM(38)。
+QIERA_FORMAT_COLS = {
+    "product": 0, "size": 1, "asin": 2, "sku": 3,
+    "stock_total": 4, "stock_fba": 5, "stock_coco": 6, "stock_own": 7,
+    "requested_qty": 8,
+    "sales_total": 9, "sales_amazon": 10, "sales_coco": 11,
+    "days_total": 12, "days_amazon": 13, "days_coco": 14,
+    "stockout_total": 15, "stockout_amazon": 16, "stockout_coco": 17,
+    "delivery_deadline": 18, "repeat_order_deadline": 19,
+    "alert_order": 20, "alert_fba": 21, "alert_coco": 22, "alert_done": 23,
+    "lot_current": 24, "lot_ordered": 25, "delivery_plan": 26, "order_lot": 27,
+    "new_lot_assign": 28, "aerologi": 29, "set_assembly": 30, "order_consider": 31,
+    "amazon_todo_date": 32, "amazon_todo": 33, "amazon_todo_qty": 34,
+    "coco_todo_date": 35, "coco_todo": 36, "coco_todo_qty": 37,
+    "sku_comment": 38,
+}
+# ココ7d/30d タブ（labo=RSL売上状況 / qiera=NE売上状況）。列構造はナチュレと同一。
+LABO_NE_COLS = {"sku": 3, "coco_7d": 4, "coco_30d": 5}
+QIERA_NE_COLS = {"sku": 3, "coco_7d": 4, "coco_30d": 5}
+
 
 @dataclass(frozen=True)
 class Brand:
@@ -89,8 +132,30 @@ BRANDS: dict[str, Brand] = {
         # 実運用前に [To:id]名前さん 形式で設定する。
         chatwork_mentions="",
     ),
-    # "labo": ...   # 悩み解決ラボ（要：実シート列マップ検証）
-    # "qiera": ...  # Qiera（要：実シート列マップ検証）
+    "labo": Brand(
+        key="labo",
+        name="悩み解決ラボ",
+        format_gid=1674969562,          # フォーマットv2
+        format_cols=LABO_FORMAT_COLS,
+        format_data_start_row=6,
+        ne_gid=491010538,               # RSL売上状況（ココ7d/30d）
+        ne_cols=LABO_NE_COLS,
+        ne_data_start_row=3,
+        rec_tab_title="📊在庫アラート(bot)",
+        chatwork_mentions="",           # 配信先=【サドナレ】業務メンバーチャット
+    ),
+    "qiera": Brand(
+        key="qiera",
+        name="Qiera",
+        format_gid=1674969562,          # フォーマット
+        format_cols=QIERA_FORMAT_COLS,
+        format_data_start_row=6,
+        ne_gid=491010538,               # NE売上状況（ココ7d/30d）
+        ne_cols=QIERA_NE_COLS,
+        ne_data_start_row=3,
+        rec_tab_title="📊在庫アラート(bot)",
+        chatwork_mentions="",           # 配信先=【Qiera】社内物流チャット
+    ),
 }
 
 

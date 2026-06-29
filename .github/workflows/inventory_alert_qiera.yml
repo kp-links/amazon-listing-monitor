@@ -1,0 +1,74 @@
+name: inventory-alert-qiera
+
+# Qiera（ディアスリー）在庫トレンド＆発注アラート。
+# 毎日 JST 09:40（=UTC 00:40）に在庫シートを点検し、加速度＋発注点で
+# 推奨事項タブを生成（毎日更新）。Chatwork配信は月・水・金のみ（通知ノイズ回避）。
+# SP-APIでAmazonの7日/30日販売を取得する。
+#
+# 秘密情報は sales30d.py（Qiera）と同じ命名を流用:
+#   - SPAPI_REFRESH_TOKEN_QIERA … Qiera口座
+#   - SPAPI_LWA_* / MARKETPLACE / HOST … 全社共通アプリ
+#   - SALES_SHEET_ID_QIERA … Qiera在庫管理シート(1pNL)
+#   - CHATWORK_TOKEN（共通） / CHATWORK_ROOM_ID_QIERA_INV
+#   - GOOGLE_SA_JSON（共通SA・対象シートに編集権限済）
+# keep-alive は同リポ cart-monitor が担うため本ワークフロー専用対策は不要。
+on:
+  schedule:
+    # 毎日 UTC 00:40 = JST 09:40（08:10の販売数更新後・他ジョブと数分ずらし）。
+    # Chatwork投稿は run ステップ内で月・水・金のみに限定。
+    - cron: "40 0 * * *"
+  workflow_dispatch:
+    inputs:
+      send_chatwork:
+        description: "Chatworkに投稿する(true) / シートだけ更新(false)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inventory-alert-qiera
+  cancel-in-progress: false
+
+jobs:
+  inventory-alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+
+      - name: Inventory trend & reorder alert (Qiera)
+        env:
+          BRAND: qiera
+          SPAPI_REFRESH_TOKEN: ${{ secrets.SPAPI_REFRESH_TOKEN_QIERA }}
+          SPAPI_LWA_CLIENT_ID: ${{ secrets.SPAPI_LWA_CLIENT_ID }}
+          SPAPI_LWA_CLIENT_SECRET: ${{ secrets.SPAPI_LWA_CLIENT_SECRET }}
+          SPAPI_MARKETPLACE_ID: ${{ secrets.SPAPI_MARKETPLACE_ID }}
+          SPAPI_HOST: ${{ secrets.SPAPI_HOST }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SALES_SHEET_ID: ${{ secrets.SALES_SHEET_ID_QIERA }}
+          CHATWORK_TOKEN: ${{ secrets.CHATWORK_TOKEN }}
+          # 投稿先=【Qiera】社内物流チャット(room 416300128)。
+          CHATWORK_ROOM_ID: ${{ secrets.CHATWORK_ROOM_ID_QIERA_INV }}
+        # シートは毎日更新。Chatwork投稿はスケジュール実行のうち月・水・金のみ。
+        # 手動実行は send_chatwork=true の時だけ投稿（既定はシートのみ）。
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.send_chatwork }}" = "true" ]; then
+              python inventory_alert.py
+            else
+              python inventory_alert.py --no-chatwork
+            fi
+          else
+            # スケジュール実行: JST曜日で投稿可否を判定（1=月..7=日）。
+            dow=$(TZ=Asia/Tokyo date +%u)
+            case "$dow" in
+              1|3|5) python inventory_alert.py ;;       # 月・水・金 → Chatwork投稿
+              *)     python inventory_alert.py --no-chatwork ;;  # 火木土日 → シートのみ
+            esac
+          fi

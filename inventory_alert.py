@@ -174,7 +174,9 @@ def sheet_clear(token: str, sheet_id: str, rng: str) -> None:
 def load_format(token: str, sheet_id: str, brand) -> list[dict]:
     title = resolve_title(token, sheet_id, brand.format_gid)
     start = brand.format_data_start_row
-    rows = sheet_read(token, sheet_id, _a1(title, f"A{start}:AN"))
+    # AZ まで広く読む（悩み解決ラボはマイクロアルジェ列増設で sku_comment が AO=40。
+    # 旧 A:AN=39 止まりだと範囲外で欠落するため AZ に拡張。空列は無害）。
+    rows = sheet_read(token, sheet_id, _a1(title, f"A{start}:AZ"))
     c = brand.format_cols
     out = []
     for r in rows:
