@@ -53,9 +53,9 @@ jobs:
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SALES_SHEET_ID: ${{ secrets.SALES_SHEET_ID_NATURE }}
           CHATWORK_TOKEN: ${{ secrets.CHATWORK_TOKEN }}
-          # 投稿先=【サドナレ】業務メンバーチャット(room 393394277)。
-          # cart-monitor用 CHATWORK_ROOM_ID_NATURE と切り離した専用Secretを使う。
-          # ※ GitHub に CHATWORK_ROOM_ID_NATURE_INV = 393394277 を登録すること。
+          # 投稿先=【ナチュレ】社内物流チャット(room 416288209)。
+          # cart-monitor用 CHATWORK_ROOM_ID_NATURE と切り離した専用Secret。
+          # ※ GitHub Secret CHATWORK_ROOM_ID_NATURE_INV = 416288209。
           CHATWORK_ROOM_ID: ${{ secrets.CHATWORK_ROOM_ID_NATURE_INV }}
         # シートは毎日更新。Chatwork投稿はスケジュール実行のうち月・水・金のみ。
         # 手動実行は send_chatwork=true の時だけ投稿（既定はシートのみ）。
