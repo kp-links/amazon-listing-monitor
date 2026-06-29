@@ -49,20 +49,24 @@ from inventory_format import SEV_RANK  # 重複定義を避け1ヶ所に集約
 
 MARKER_PREFIX = "⚠️ bot自動生成"   # 推奨事項タブのbot所有印（人手タブ誤上書き防止）
 REC_HEADERS = [
-    "更新日時", "優先度", "区分", "商品名", "サイズ", "SKU", "ASIN",
+    "更新日時", "優先度", "区分", "対応済", "商品名", "サイズ", "SKU", "ASIN",
     "総在庫", "FBA", "ココ", "自社", "依頼済",
     "A日販7d", "A日販30d", "A加速", "コ日販7d", "コ日販30d", "コ加速",
     "FBA在庫日数", "総在庫日数", "在庫切れ予想(総)", "発注点ROP",
     "現→発注済", "推奨アクション", "根拠",
 ]
-REC_COLS = len(REC_HEADERS)  # 25 → A..Y
+REC_COLS = len(REC_HEADERS)  # 26 → A..Z
+# 「対応済」= フォーマットの対応済列（labo/nature=Z, qiera=X）が Y のとき ✅。
+# FBA納品等のアラートに倉庫側が着手済みかを一目で分かるようにする列。
 
 # 推奨事項タブの見た目（視認性）設定 ───────────────────────────────────────
-COL_WIDTHS = [86, 60, 122, 150, 44, 148, 100, 62, 56, 62, 48, 58,
+# ※ 列を挿入したら下記の列インデックスをすべて再採番すること（データ正誤はヘッダ↔
+#   行の対応で担保。ここは色/幅/罫線の見た目のみ）。
+COL_WIDTHS = [86, 60, 122, 52, 150, 44, 148, 100, 62, 56, 62, 48, 58,
               60, 66, 56, 60, 66, 56, 70, 70, 96, 70, 86, 400, 168]
-INT_COLS = [7, 8, 9, 10, 11, 18, 19, 21]   # 桁区切り整数
-DEC_COLS = [12, 13, 15, 16]                # 日販（小数1）
-ACC_COLS = [14, 17]                        # 加速倍率
+INT_COLS = [8, 9, 10, 11, 12, 19, 20, 22]  # 桁区切り整数
+DEC_COLS = [13, 14, 16, 17]                # 日販（小数1）
+ACC_COLS = [15, 18]                        # 加速倍率
 SEV_BG = {  # 優先度ごとの薄い行背景（スキャンしやすく）
     "🚨": {"red": 1.0, "green": 0.89, "blue": 0.89},
     "🔴": {"red": 1.0, "green": 0.95, "blue": 0.86},
@@ -75,13 +79,13 @@ _WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
 _NOTE_BG = {"red": 0.93, "green": 0.93, "blue": 0.93}
 # 列グループ別の薄い背景（数値ブロックを見分けやすく）: (開始列, 終了列exclusive, 色)
 COL_GROUPS = [
-    (7, 12, {"red": 0.90, "green": 0.95, "blue": 1.00}),   # 在庫 H-L（薄青）
-    (12, 15, {"red": 0.91, "green": 0.97, "blue": 0.91}),  # Amazon販売 M-O（薄緑）
-    (15, 18, {"red": 0.86, "green": 0.95, "blue": 0.94}),  # ココ販売 P-R（薄青緑）
-    (18, 21, {"red": 1.00, "green": 0.96, "blue": 0.87}),  # 在庫日数/予想 S-U（薄橙）
-    (21, 23, {"red": 0.96, "green": 0.93, "blue": 0.99}),  # 発注 V-W（薄紫）
+    (8, 13, {"red": 0.90, "green": 0.95, "blue": 1.00}),   # 在庫（薄青）
+    (13, 16, {"red": 0.91, "green": 0.97, "blue": 0.91}),  # Amazon販売（薄緑）
+    (16, 19, {"red": 0.86, "green": 0.95, "blue": 0.94}),  # ココ販売（薄青緑）
+    (19, 22, {"red": 1.00, "green": 0.96, "blue": 0.87}),  # 在庫日数/予想（薄橙）
+    (22, 24, {"red": 0.96, "green": 0.93, "blue": 0.99}),  # 発注（薄紫）
 ]
-GROUP_BORDER_COLS = [7, 12, 15, 18, 21, 23]  # グループ境界に縦罫線
+GROUP_BORDER_COLS = [8, 13, 16, 19, 22, 24]  # グループ境界に縦罫線
 _BORDER = {"style": "SOLID", "color": {"red": 0.7, "green": 0.7, "blue": 0.7}}
 
 
@@ -418,6 +422,7 @@ def _rec_row(r: dict, ts: str) -> list:
     def fa(v): return "" if v is None else round(v, 1)
     return [
         ts, r["primary_sev"], "／".join(sorted({t["kind"] for t in r["triggers"]})),
+        ("✅" if r.get("done") else ""),
         r["product"], r["size"], r["sku"], r["asin"],
         r["stock_total"], r["stock_fba"], r["stock_coco"], r.get("stock_own") or 0,
         r["requested_qty"],
@@ -522,7 +527,7 @@ def format_rec_tab(token, sheet_id, gid, sevs, prev_rows):
                     "textFormat": {"bold": True, "fontSize": 11}}},
                 "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)"))
         # 推奨アクション・根拠は折返し
-        for c in (23, 24):
+        for c in (24, 25):
             reqs.append(_cell_fmt(gid, 2, end, c, c + 1,
                 {"userEnteredFormat": {"wrapStrategy": "WRAP"}},
                 "userEnteredFormat.wrapStrategy"))
