@@ -1,8 +1,9 @@
 name: inventory-alert-nature
 
 # ナチュレ（LUBEE）在庫トレンド＆発注アラート。
-# 月・水・金 JST 09:30（=UTC 00:30）に在庫シートを点検し、加速度＋発注点で
-# 推奨事項タブを生成→Chatwork配信。SP-APIでAmazonの7日/30日販売を取得する。
+# 毎日 JST 09:30（=UTC 00:30）に在庫シートを点検し、加速度＋発注点で
+# 推奨事項タブを生成（毎日更新）。Chatwork配信は月・水・金のみ（通知ノイズ回避）。
+# SP-APIでAmazonの7日/30日販売を取得する。
 #
 # 秘密情報は monitor.py / sales30d.py と同じ命名を流用（新規Secret不要）:
 #   - SPAPI_REFRESH_TOKEN_NATURE … ナチュレ口座
@@ -13,7 +14,9 @@ name: inventory-alert-nature
 # keep-alive は同リポ cart-monitor が担うため本ワークフロー専用対策は不要。
 on:
   schedule:
-    - cron: "30 0 * * 1,3,5"    # UTC 00:30 = JST 09:30（08:05の販売数更新後）
+    # 毎日 UTC 00:30 = JST 09:30（08:05の販売数更新後）。シートは毎日更新。
+    # Chatwork投稿は run ステップ内で月・水・金のみに限定。
+    - cron: "30 0 * * *"
   workflow_dispatch:             # 手動実行（初回検証・サンプル生成用）
     inputs:
       send_chatwork:
@@ -54,10 +57,20 @@ jobs:
           # cart-monitor用 CHATWORK_ROOM_ID_NATURE と切り離した専用Secretを使う。
           # ※ GitHub に CHATWORK_ROOM_ID_NATURE_INV = 393394277 を登録すること。
           CHATWORK_ROOM_ID: ${{ secrets.CHATWORK_ROOM_ID_NATURE_INV }}
-        # スケジュール実行は常に投稿。手動実行は send_chatwork=true の時だけ投稿。
+        # シートは毎日更新。Chatwork投稿はスケジュール実行のうち月・水・金のみ。
+        # 手動実行は send_chatwork=true の時だけ投稿（既定はシートのみ）。
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.send_chatwork }}" != "true" ]; then
-            python inventory_alert.py --no-chatwork
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.send_chatwork }}" = "true" ]; then
+              python inventory_alert.py
+            else
+              python inventory_alert.py --no-chatwork
+            fi
           else
-            python inventory_alert.py
+            # スケジュール実行: JST曜日で投稿可否を判定（1=月..7=日）。
+            dow=$(TZ=Asia/Tokyo date +%u)
+            case "$dow" in
+              1|3|5) python inventory_alert.py ;;       # 月・水・金 → Chatwork投稿
+              *)     python inventory_alert.py --no-chatwork ;;  # 火木土日 → シートのみ
+            esac
           fi
