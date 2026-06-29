@@ -37,12 +37,12 @@ JST = timezone(timedelta(hours=9))
 # リポジトリには商品リストを置かない（public化のため）。新規ASINはシートに行追加で対応。
 
 # 列: A=ASIN B=商品名(簡易) C=SKU D=アラート除外 E=メモ F=最終ステータス G=最終チェック
-#     H=相乗りセラーID I=ベストセラー J=バリエーション親（F以降は自動更新）
+#     H=相乗りセラーID I=ベストセラー J=バリエーション親 K=ブラウズノード（F以降は自動更新）
 (COL_ASIN, COL_NAME, COL_SKU, COL_MUTE, COL_MEMO, COL_STATUS, COL_CHECK,
- COL_SELLERS, COL_BEST, COL_PARENT) = range(10)
+ COL_SELLERS, COL_BEST, COL_PARENT, COL_BROWSE) = range(11)
 HEADER = ["ASIN", "商品名", "SKU", "アラート除外", "メモ",
           "最終ステータス(自動)", "最終チェック(自動)", "相乗りセラーID(自動)",
-          "ベストセラー(自動)", "バリエーション親(自動)"]
+          "ベストセラー(自動)", "バリエーション親(自動)", "ブラウズノード(自動)"]
 STOREFRONT = "https://www.amazon.co.jp/sp?seller={}"  # セラー名はSP-APIで取れずURLで代替
 
 # ステータス定義（severityで通知要否を判定）
@@ -186,8 +186,10 @@ def get_fba_inventory(token: str) -> dict:
 
 
 def get_catalog_all(token: str, asins: list) -> dict:
-    """ASIN群の {asin: {best:bool, rank:int|None, cat:str, parents:[..]}} を batch取得。
-    best=最小カテゴリで rank==1（ベストセラー推定）。parents=VARIATION親ASIN。"""
+    """ASIN群の {asin: {best:bool, rank:int|None, cat:str, parents:[..],
+    browse_id:str, browse_name:str}} を batch取得。
+    best=最小カテゴリで rank==1（ベストセラー推定）。parents=VARIATION親ASIN。
+    browse_*=summaries.browseClassification（登録ブラウズノード＝カテゴリ移動検知用）。"""
     host = _env("SPAPI_HOST")
     mp = _env("SPAPI_MARKETPLACE_ID")
     url = f"https://{host}/catalog/2022-04-01/items"
@@ -196,7 +198,7 @@ def get_catalog_all(token: str, asins: list) -> dict:
     for i in range(0, len(uniq), 20):
         chunk = uniq[i:i + 20]
         params = {"identifiers": ",".join(chunk), "identifiersType": "ASIN", "marketplaceIds": mp,
-                  "includedData": "salesRanks,relationships", "pageSize": 20}
+                  "includedData": "salesRanks,relationships,summaries", "pageSize": 20}
         resp = None
         for attempt in range(4):
             resp = requests.get(url, params=params, headers={"x-amz-access-token": token}, timeout=30)
@@ -230,9 +232,16 @@ def get_catalog_all(token: str, asins: list) -> dict:
                 for rel in blk.get("relationships", []) or []:
                     if rel.get("type") == "VARIATION":
                         parents += rel.get("parentAsins") or []
+            # ブラウズノード（summaries.browseClassification）＝対象marketplace優先
+            summaries = it.get("summaries", []) or []
+            summ = next((s for s in summaries if s.get("marketplaceId") == mp),
+                        summaries[0] if summaries else {})
+            bc = summ.get("browseClassification") or {}
             if a:
                 out[a] = {"best": 1 in ranks, "rank": min(ranks) if ranks else None,
-                          "cat": best_cat, "parents": sorted(set(parents))}
+                          "cat": best_cat, "parents": sorted(set(parents)),
+                          "browse_id": str(bc.get("classificationId") or ""),
+                          "browse_name": str(bc.get("displayName") or "")}
         time.sleep(0.3)
     return out
 
@@ -296,10 +305,10 @@ def main() -> int:
     gtok = sheets_service_token()
 
     # ヘッダを設定
-    sheet_update(gtok, sheet_id, "A1:J1", [HEADER])
+    sheet_update(gtok, sheet_id, "A1:K1", [HEADER])
 
     # 1) シート読込（ヘッダ除く）＝監視対象の正本。新規ASINはシートに手動で行追加する。
-    rows = sheet_get(gtok, sheet_id, "A2:J")
+    rows = sheet_get(gtok, sheet_id, "A2:K")
 
     # 2) 各ASINを判定
     token = lwa_token()
@@ -307,25 +316,28 @@ def main() -> int:
     cat = get_catalog_all(token, [r[COL_ASIN].strip() for r in rows
                                   if r and len(r) > COL_ASIN and r[COL_ASIN].strip()])
     now = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
-    writes = []          # 各行の [F状態, G時刻, H相乗りID, Iベストセラー, Jバリ親]
+    writes = []          # 各行の [F状態, G時刻, H相乗りID, Iベストセラー, Jバリ親, Kブラウズ]
     problems = []        # 通知ブロック（ASIN単位）
-    n_cart = n_search = n_hijack = n_best = n_var = 0
+    n_cart = n_search = n_hijack = n_best = n_var = n_browse = 0
     for r in rows:
-        r = (r + [""] * 10)[:10]
+        r = (r + [""] * 11)[:11]
         asin = r[COL_ASIN].strip()
         if not asin:
-            writes.append([r[COL_STATUS], r[COL_CHECK], r[COL_SELLERS], r[COL_BEST], r[COL_PARENT]])
+            writes.append([r[COL_STATUS], r[COL_CHECK], r[COL_SELLERS], r[COL_BEST],
+                           r[COL_PARENT], r[COL_BROWSE]])
             continue
         sku, name = r[COL_SKU].strip(), r[COL_NAME].strip()
         muted = str(r[COL_MUTE]).strip().upper() in ("TRUE", "1", "YES", "✓")
         prev_sellers = {s.strip() for s in str(r[COL_SELLERS]).split(",") if s.strip()}
         prev_best, prev_parent = r[COL_BEST].strip(), r[COL_PARENT].strip()
+        prev_browse = r[COL_BROWSE].strip()
         if muted:
-            writes.append([ST_MUTED, now, r[COL_SELLERS], r[COL_BEST], r[COL_PARENT]])
+            writes.append([ST_MUTED, now, r[COL_SELLERS], r[COL_BEST], r[COL_PARENT], r[COL_BROWSE]])
             continue
         payload = get_item_offers(token, asin)
         if payload is None:
-            writes.append([r[COL_STATUS] or "判定不可", now, r[COL_SELLERS], r[COL_BEST], r[COL_PARENT]])
+            writes.append([r[COL_STATUS] or "判定不可", now, r[COL_SELLERS], r[COL_BEST],
+                           r[COL_PARENT], r[COL_BROWSE]])
             time.sleep(0.6)
             continue
         offers = payload.get("Offers", []) or []
@@ -355,11 +367,12 @@ def main() -> int:
         if search_off:
             issues.append("検索対象外")
 
-        # ベストセラー / バリエーション（Catalog）。初回(prev空)はbaseline記録のみ＝通知しない。
+        # ベストセラー / バリエーション / ブラウズノード（Catalog）。
+        # 初回(prev空)はbaseline記録のみ＝通知しない。
         c = cat.get(asin)
-        best_event = var_event = None
-        if c is None:   # Catalog未取得 → I/J保持・イベント判定スキップ（解体の誤検知防止）
-            best_str, parents_now = prev_best, (prev_parent or "")
+        best_event = var_event = browse_event = None
+        if c is None:   # Catalog未取得 → I/J/K保持・イベント判定スキップ（誤検知防止）
+            best_str, parents_now, browse_str = prev_best, (prev_parent or ""), prev_browse
         else:
             best_now = bool(c.get("best"))
             parents_now = ",".join(c.get("parents") or []) or "なし"
@@ -375,26 +388,41 @@ def main() -> int:
                     var_event = "バリエーション解体"
                 elif parents_now != prev_parent:
                     var_event = "バリエーション構成変化"
+            # ブラウズノード＝classificationId主軸で比較（同名別ノード移動を検知し
+            # 表示名リネームの誤検知を回避）、表示は "ID｜名称"。取得空は保持。
+            bid = str(c.get("browse_id") or "").strip()
+            bname = str(c.get("browse_name") or "").strip()
+            if not (bid or bname):
+                browse_str = prev_browse
+            else:
+                browse_str = f"{bid}｜{bname}" if bid else bname
+                if prev_browse and prev_browse != "なし" and prev_browse != browse_str:
+                    prev_id = prev_browse.split("｜", 1)[0].strip()
+                    if bid and prev_id:        # 双方IDあり＝IDで判定（表示名揺れを無視）
+                        if bid != prev_id:
+                            browse_event = "ブラウズノード変更"
+                    else:                       # ID欠落（旧baseline等）＝文字列差で判定
+                        browse_event = "ブラウズノード変更"
 
         status_parts = list(issues) + (["相乗りあり"] if others else [])
         status_str = "／".join(status_parts) if status_parts else ST_OK
-        writes.append([status_str, now, ",".join(others), best_str, parents_now])
+        writes.append([status_str, now, ",".join(others), best_str, parents_now, browse_str])
 
         new_sellers = [s for s in others if s not in prev_sellers]
-        if not (issues or new_sellers or best_event or var_event):
+        if not (issues or new_sellers or best_event or var_event or browse_event):
             time.sleep(0.6)
             continue
 
         # 通知ブロック（ASIN単位）
         if any(i in ("カート喪失", "自社出品消失") for i in issues):
             sev = "🔴"
-        elif var_event or best_event == "ベストセラー消失":
+        elif var_event or browse_event or best_event == "ベストセラー消失":
             sev = "🔻"
         elif best_event == "ベストセラー点灯":
             sev = "🏅"
         else:
             sev = "🟠"
-        heads = list(issues) + [e for e in (best_event, var_event) if e]
+        heads = list(issues) + [e for e in (best_event, var_event, browse_event) if e]
         block = [f"{sev} {'／'.join(heads) if heads else '他社相乗り'}",
                  f"  {name}（{sku}）" if sku else f"  {name}"]
         if "自社出品消失" in issues:
@@ -420,6 +448,9 @@ def main() -> int:
             block.append(f"  ※カテゴリ「{c.get('cat') or '—'}」で1位（ベストセラー圏）")
         elif best_event == "ベストセラー消失":
             block.append(f"  ※ベストセラー圏から外れました（現順位 {c.get('rank') or '—'}）")
+        if browse_event:
+            block.append(f"  ※ブラウズノード: {prev_browse} → {browse_str}"
+                         "（カテゴリ移動＝検索面/ベストセラー基準カテゴリ/サジェストに影響）")
         ctx = []
         if own_p is not None:
             ctx.append(f"自社¥{own_p:,.0f}")
@@ -442,11 +473,12 @@ def main() -> int:
         n_hijack += 1 if new_sellers else 0
         n_best += 1 if best_event else 0
         n_var += 1 if var_event else 0
+        n_browse += 1 if browse_event else 0
         time.sleep(0.6)
 
-    # 3) 自動列をシートへ書き戻し（F:J＝状態/時刻/相乗りID/ベストセラー/バリ親）
+    # 3) 自動列をシートへ書き戻し（F:K＝状態/時刻/相乗りID/ベストセラー/バリ親/ブラウズ）
     if writes:
-        sheet_update(gtok, sheet_id, f"F2:J{1 + len(writes)}", writes)
+        sheet_update(gtok, sheet_id, f"F2:K{1 + len(writes)}", writes)
 
     # 4) Chatwork へ集約通知
     if problems:
@@ -454,10 +486,10 @@ def main() -> int:
                 + "\n".join(problems)
                 + "\n[hr]※セラー名はストアURLをクリックで確認。"
                   "カート落ち/検索対象外は解消かミュート(管理シート「アラート除外」TRUE)まで毎回通知。"
-                  "ベストセラー/バリエーションは変化時のみ。[/info]")
+                  "ベストセラー/バリエーション/ブラウズノードは変化時のみ。[/info]")
         chatwork_post(body)
         print(f"[alert] cart={n_cart} search={n_search} hijack={n_hijack} "
-              f"best={n_best} var={n_var} ASIN={len(problems)} 通知")
+              f"best={n_best} var={n_var} browse={n_browse} ASIN={len(problems)} 通知")
     else:
         print("[ok] 新規異常なし")
     return 0
