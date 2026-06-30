@@ -149,7 +149,16 @@ def fetch_orders_tsv(token: str, start_iso: str, end_iso: str) -> str:
 
 
 def sum_quantity_by_asin(tsv_text: str) -> dict[str, int]:
-    """注文TSV → {asin: 30日数量}。Cancelled を除外して quantity を合算。"""
+    """注文TSV → {asin: 30日数量}。Cancelled と在庫返送/一括出庫を除外して quantity を合算。
+
+    在庫返送(FBA removal order)・一括出庫は All Orders レポートに
+    sales-channel="Non-Amazon"（item-price=null・order-id 接頭辞 "S0..."）で現れ、
+    販売でなく在庫移動なのに大きな quantity を持つ。これを販売数に数えると過剰計上に
+    なるため、sales-channel == "Amazon.co.jp" の行のみを計上する。
+    ※同じ除外を keypath_ai_amazon 側でも sales-channel フィルタで実施済み。
+    ※注意: MCF(マルチチャネル出荷)も Non-Amazon で出るため一律除外される。
+            当出店は現状MCF売上が無く実害なしだが、MCF運用を始めたら過小化する。
+    """
     if not tsv_text.strip():
         return {}
     reader = csv.DictReader(io.StringIO(tsv_text), delimiter="\t")
@@ -158,9 +167,21 @@ def sum_quantity_by_asin(tsv_text: str) -> dict[str, int]:
     if missing:
         raise ValueError(f"注文レポートに必須列が無い: {sorted(missing)}"
                          "（レポート種別 / Amazon仕様変更を確認）")
+    # sales-channel は通常存在する標準列。万一の Amazon 仕様変更で欠落した場合、
+    # 全行を Non-Amazon 扱いして空集計→C列ゼロ破壊するのを避けるため、列が
+    # 無ければ返送除外をスキップし警告のみ出す（fail-loud だが数値保全を優先）。
+    has_channel = "sales-channel" in (reader.fieldnames or [])
+    if not has_channel:
+        print("[warn] sales-channel 列が無い → 在庫返送の除外をスキップ"
+              "（Amazon仕様変更の可能性。過剰計上が残るおそれ）")
     totals: dict[str, int] = {}
+    skipped_non_amazon = 0
     for row in reader:
         if (row.get("order-status") or "").strip() == "Cancelled":
+            continue
+        if has_channel and (row.get("sales-channel") or "").strip() != "Amazon.co.jp":
+            # Non-Amazon = 在庫返送/一括出庫/MCF等の在庫移動。販売数に数えない。
+            skipped_non_amazon += 1
             continue
         asin = (row.get("asin") or "").strip()
         if not asin:
@@ -173,6 +194,9 @@ def sum_quantity_by_asin(tsv_text: str) -> dict[str, int]:
             print(f"[warn] quantity 解析不可 asin={asin} 値='{q}' → 0 扱い")
             qty = 0
         totals[asin] = totals.get(asin, 0) + qty
+    if skipped_non_amazon:
+        print(f"[info] Non-Amazon行(在庫返送/一括出庫/MCF)を {skipped_non_amazon} 件除外"
+              "（販売数に不算入）")
     return totals
 
 
