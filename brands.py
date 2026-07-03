@@ -16,6 +16,8 @@ SP-API refresh token）は環境変数で注入し、ここには置かない。
 from __future__ import annotations
 from dataclasses import dataclass, field
 
+from sheet_health import SourceTab
+
 
 @dataclass(frozen=True)
 class Thresholds:
@@ -96,6 +98,28 @@ QIERA_FORMAT_COLS = {
 LABO_NE_COLS = {"sku": 3, "coco_7d": 4, "coco_30d": 5}
 QIERA_NE_COLS = {"sku": 3, "coco_7d": 4, "coco_30d": 5}
 
+# 健全性チェック対象のソースタブ（sheet_health.py が毎朝点検）。
+# ⚠️ gid・キー列はブランドごとに実シートで実地検証してから追加すること。
+#    未設定ブランド（health_tabs=()）はチェック自体をスキップする。
+# labo 2026-07-03 実地検証: フォーマットv2のSUMIFS参照先と突合キーは
+#   Amazon在庫=C列ASIN / 楽天全在庫情報2=D列SKU / Amazon販売数管理=A列ASIN /
+#   RSL売上状況=D列SKU。マイクロアルジェ在庫2はIMPORTRANGE直参照のため
+#   エラー値スキャンのみ（在庫は出荷時しか動かず指紋チェックは誤検知源）。
+LABO_HEALTH_TABS = (
+    SourceTab(gid=246787435, label="Amazon在庫", data_start_row=2,
+              key_kind="asin", key_col=2),
+    SourceTab(gid=1302069804, label="楽天全在庫情報2（ココドット在庫）", data_start_row=2,
+              key_kind="sku", key_col=3),
+    SourceTab(gid=1707721264, label="Amazon販売数管理", data_start_row=2,
+              key_kind="asin", key_col=0),
+    SourceTab(gid=491010538, label="RSL売上状況（ココ販売数）", data_start_row=3,
+              key_kind="sku", key_col=3),
+    SourceTab(gid=280604776, label="マイクロアルジェ在庫2", data_start_row=5,
+              fingerprint=False),
+    SourceTab(gid=1674969562, label="フォーマットv2", data_start_row=6,
+              fingerprint=False),
+)
+
 
 @dataclass(frozen=True)
 class Brand:
@@ -110,6 +134,8 @@ class Brand:
     rec_tab_title: str             # 推奨事項（bot専用出力）タブ名
     chatwork_mentions: str         # Chatwork メンション文字列（[To:...]）
     thresholds: Thresholds = field(default_factory=Thresholds)
+    health_tabs: tuple = ()        # 健全性チェック対象タブ（未設定=スキップ）
+    format_date_cell: str = ""     # フォーマットの基準日セル（例 "C2"。空=チェックなし）
 
 
 # シートURLは実行時に SALES_SHEET_ID（secret）から組み立てる（IDをコードに残さない）。
@@ -143,6 +169,8 @@ BRANDS: dict[str, Brand] = {
         ne_data_start_row=3,
         rec_tab_title="📊在庫アラート(bot)",
         chatwork_mentions="",           # 配信先=【サドナレ】業務メンバーチャット
+        health_tabs=LABO_HEALTH_TABS,
+        format_date_cell="C2",          # 更新日（在庫切れ予想日の起点）
     ),
     "qiera": Brand(
         key="qiera",

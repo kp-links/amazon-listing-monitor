@@ -45,6 +45,7 @@ from sales30d import (
 )
 import brands as brands_mod
 import inventory_format
+import sheet_health
 from inventory_format import SEV_RANK  # 重複定義を避け1ヶ所に集約
 
 MARKER_PREFIX = "⚠️ bot自動生成"   # 推奨事項タブのbot所有印（人手タブ誤上書き防止）
@@ -595,7 +596,10 @@ def main() -> int:
     ap.add_argument("--no-spapi", action="store_true",
                     help="SP-APIを使わずシートのAmazon30日のみで動作（Amazon加速なし）")
     ap.add_argument("--no-chatwork", action="store_true",
-                    help="推奨事項シートは更新するがChatwork投稿はしない")
+                    help="在庫アラート本文のChatwork投稿をしない（シート更新はする）。"
+                         "※データ健全性の警告は本フラグと独立に投稿する（毎日監視のため）")
+    ap.add_argument("--no-health", action="store_true",
+                    help="データ健全性チェック（sheet_health）を実行しない")
     args = ap.parse_args()
 
     brand = brands_mod.get_brand(args.brand)
@@ -607,6 +611,42 @@ def main() -> int:
     fmt_rows = load_format(gtok, sheet_id, brand)
     ne_map = load_ne(gtok, sheet_id, brand)
     print(f"[info] {brand.name}: フォーマット{len(fmt_rows)}SKU / NE{len(ne_map)}SKU")
+
+    # データ健全性チェック（サイレント障害検知）。失敗しても本体は止めない。
+    # 警告は曜日ゲート（--no-chatwork）と独立に投稿する（火木土日でも通知）。
+    # 状態保存は投稿成否の確定後（失敗時は通知状態を進めず次回再送させる）。
+    health_body = ""
+    if not args.no_health:
+        try:
+            h_issues, health_body, h_state = sheet_health.run_health_checks(
+                gtok, sheet_id, brand, fmt_rows, now, dry_run=args.dry_run)
+            for i in h_issues:
+                print(f"[health] {i['sev']} {i['title']} / {i['detail']}")
+            if not h_issues:
+                print("[info] 健全性チェック: 異常なし")
+            if not args.dry_run:
+                posted = False
+                if health_body:
+                    # _env(required=True)はSystemExitで本体ごと落とすため使わない
+                    # （Chatwork未設定のローカル実行でもシート更新は完遂させる）。
+                    cw_token = os.getenv("CHATWORK_TOKEN", "")
+                    cw_room = os.getenv("CHATWORK_ROOM_ID", "")
+                    if cw_token and cw_room:
+                        try:
+                            resp = chatwork_post(cw_token, cw_room, health_body)
+                            posted = True
+                            print(f"[ok] 健全性警告をChatwork投稿 "
+                                  f"message_id={resp.get('message_id')}")
+                        except Exception as e:
+                            print(f"[warn] 健全性警告のChatwork投稿失敗（次回再送）: "
+                                  f"{type(e).__name__}: {str(e)[:200]}")
+                    else:
+                        print("[warn] CHATWORK_TOKEN/ROOM未設定→健全性警告は投稿せず"
+                              "（次回再送）。本文:\n" + health_body)
+                sheet_health.commit_state(gtok, sheet_id, h_state, posted)
+        except Exception as e:
+            print(f"[warn] 健全性チェック失敗（在庫アラート本体は継続）: "
+                  f"{type(e).__name__}: {str(e)[:200]}")
 
     use_spapi = not args.no_spapi
     amz7, amz30 = {}, {}
@@ -630,6 +670,9 @@ def main() -> int:
     if args.dry_run:
         print("\n===== DRY RUN (Chatwork本文) =====\n")
         print(body)
+        if health_body:
+            print("\n===== DRY RUN (健全性警告 Chatwork本文) =====\n")
+            print(health_body)
         print("\n===== 推奨事項シート行（先頭5件）=====")
         ts = now.strftime("%Y/%m/%d %H:%M")
         for r in result["results"][:5]:
