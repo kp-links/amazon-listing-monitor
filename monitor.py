@@ -38,12 +38,21 @@ JST = timezone(timedelta(hours=9))
 
 # 列: A=ASIN B=商品名(簡易) C=SKU D=アラート除外 E=メモ F=最終ステータス G=最終チェック
 #     H=相乗りセラーID I=ベストセラー J=バリエーション親 K=ブラウズノード（F以降は自動更新）
+# 列I の値: TRUE=タグ推定 / RANK1=カテゴリ1位だがノード商品数<100でタグ対象外 / FALSE。
+# ノード商品数のキャッシュは別タブ NODE_TAB（自動作成・日次更新）。
 (COL_ASIN, COL_NAME, COL_SKU, COL_MUTE, COL_MEMO, COL_STATUS, COL_CHECK,
  COL_SELLERS, COL_BEST, COL_PARENT, COL_BROWSE) = range(11)
 HEADER = ["ASIN", "商品名", "SKU", "アラート除外", "メモ",
           "最終ステータス(自動)", "最終チェック(自動)", "相乗りセラーID(自動)",
           "ベストセラー(自動)", "バリエーション親(自動)", "ブラウズノード(自動)"]
 STOREFRONT = "https://www.amazon.co.jp/sp?seller={}"  # セラー名はSP-APIで取れずURLで代替
+
+# ベストセラータグ付与のノード商品数条件（親ASIN単位・Amazon非公開の経験則）。
+# カテゴリ1位でもノード商品数が閾値未満だとタグは付かない（例: 微量ミネラル96件のピュアビタC）。
+BSR_MIN_NODE_ITEMS = 100
+NODE_TAB = "ノードサイズ"      # ノード商品数キャッシュ用タブ（自動作成）
+NODE_TTL_HOURS = 24            # 商品数の再計測間隔（計測は数十APIコールかかるため日次）
+NODE_TAB_HEADER = ["ノードID", "ノード名", "推定商品数(自動)", "最終計測(自動)"]
 
 # ステータス定義（severityで通知要否を判定）
 ST_OK = "正常"
@@ -186,10 +195,12 @@ def get_fba_inventory(token: str) -> dict:
 
 
 def get_catalog_all(token: str, asins: list) -> dict:
-    """ASIN群の {asin: {best:bool, rank:int|None, cat:str, parents:[..],
-    browse_id:str, browse_name:str}} を batch取得。
-    best=最小カテゴリで rank==1（ベストセラー推定）。parents=VARIATION親ASIN。
-    browse_*=summaries.browseClassification（登録ブラウズノード＝カテゴリ移動検知用）。"""
+    """ASIN群の {asin: {rank1_node:str, rank1_title:str, display_best:bool,
+    rank:int|None, cat:str, parents:[..], browse_id:str, browse_name:str}} を batch取得。
+    rank1_node/rank1_title=classificationRanks で rank==1 のノードID/名称（無ければ空）。
+    タグ推定の最終判定は main 側（ノード商品数>=100 条件を加味）。
+    display_best=displayGroupRanks(ドラッグストア等の表示グループ)で rank==1。
+    parents=VARIATION親ASIN。browse_*=summaries.browseClassification（カテゴリ移動検知用）。"""
     host = _env("SPAPI_HOST")
     mp = _env("SPAPI_MARKETPLACE_ID")
     url = f"https://{host}/catalog/2022-04-01/items"
@@ -220,13 +231,24 @@ def get_catalog_all(token: str, asins: list) -> dict:
         for it in items:
             a = it.get("asin")
             ranks, best_cat = [], None
+            rank1_node = rank1_title = ""
+            display_best = False
             for blk in it.get("salesRanks", []) or []:
-                for rr in (blk.get("classificationRanks", []) or []) + (blk.get("displayGroupRanks", []) or []):
+                for rr in blk.get("classificationRanks", []) or []:
                     rk = rr.get("rank")
                     if isinstance(rk, int):
                         ranks.append(rk)
-                        if rk == 1 and not best_cat:
-                            best_cat = rr.get("title")
+                        if rk == 1 and not rank1_node:
+                            rank1_node = str(rr.get("classificationId") or "")
+                            rank1_title = str(rr.get("title") or "")
+                            best_cat = best_cat or rr.get("title")
+                for rr in blk.get("displayGroupRanks", []) or []:
+                    rk = rr.get("rank")
+                    if isinstance(rk, int):
+                        ranks.append(rk)
+                        if rk == 1:
+                            display_best = True
+                            best_cat = best_cat or rr.get("title")
             parents = []
             for blk in it.get("relationships", []) or []:
                 for rel in blk.get("relationships", []) or []:
@@ -238,12 +260,107 @@ def get_catalog_all(token: str, asins: list) -> dict:
                         summaries[0] if summaries else {})
             bc = summ.get("browseClassification") or {}
             if a:
-                out[a] = {"best": 1 in ranks, "rank": min(ranks) if ranks else None,
+                out[a] = {"rank1_node": rank1_node, "rank1_title": rank1_title,
+                          "display_best": display_best,
+                          "rank": min(ranks) if ranks else None,
                           "cat": best_cat, "parents": sorted(set(parents)),
                           "browse_id": str(bc.get("classificationId") or ""),
                           "browse_name": str(bc.get("displayName") or "")}
         time.sleep(0.3)
     return out
+
+
+def _node_keywords(title: str) -> list:
+    """ノード名からsearchCatalogItems用キーワード候補を生成。
+
+    classificationIds は単独指定不可（keywords必須）のため、ノード名そのもの＋
+    サプリ系サフィックスを落とした短縮形で検索する。較正(2026-07-08): この2語で
+    微量ミネラル=最大rank94(店頭96) / ヒアルロン酸=248 を再現。"""
+    kws = [title]
+    for suffix in ("サプリメント", "サプリ"):
+        if title.endswith(suffix) and len(title) > len(suffix):
+            kws.append(title[: -len(suffix)])
+    return kws
+
+
+def estimate_node_size(token: str, node_id: str, title: str) -> int | None:
+    """ブラウズノード内のランク付き商品数（親ASIN単位）を推定。取得失敗は None。
+
+    手法: searchCatalogItems(keywords=ノード名, classificationIds=node) で子ASINを
+    収集し、salesRanks の当該ノード最大rank を返す（rankはバリエーション親単位で
+    採番されるため 最大rank ≒ 親ASIN数。numberOfResults は子ASIN込み＋検索網羅性で
+    大きくブレるため不採用）。約20〜50APIコール/ノードかかるので呼び出しは日次。"""
+    host = _env("SPAPI_HOST")
+    mp = _env("SPAPI_MARKETPLACE_ID")
+    url = f"https://{host}/catalog/2022-04-01/items"
+    if not title:
+        return None
+    asins: set = set()
+    for kw in _node_keywords(title):
+        page_token = None
+        for _page in range(15):     # 300件で打ち切り（閾値100の判定には十分）
+            params = {"marketplaceIds": mp, "classificationIds": node_id,
+                      "keywords": kw, "pageSize": 20}
+            if page_token:
+                params["pageToken"] = page_token
+            resp = None
+            for attempt in range(4):
+                resp = requests.get(url, params=params,
+                                    headers={"x-amz-access-token": token}, timeout=30)
+                if resp.status_code == 200:
+                    break
+                if resp.status_code in (429, 503):
+                    time.sleep(2 * (2 ** attempt))
+                    continue
+                print(f"  [warn] node {node_id}: search HTTP {resp.status_code}")
+                resp = None
+                break
+            if resp is None or resp.status_code != 200:
+                break
+            try:
+                j = resp.json()
+            except ValueError:
+                break
+            asins.update(it.get("asin") for it in j.get("items", []) if it.get("asin"))
+            page_token = (j.get("pagination") or {}).get("nextToken")
+            time.sleep(1.1)
+            if not page_token:
+                break
+    if not asins:
+        return None
+    ranks = []
+    uniq = sorted(asins)
+    for i in range(0, len(uniq), 20):
+        chunk = uniq[i:i + 20]
+        params = {"identifiers": ",".join(chunk), "identifiersType": "ASIN",
+                  "marketplaceIds": mp, "includedData": "salesRanks", "pageSize": 20}
+        resp = None
+        for attempt in range(4):
+            resp = requests.get(url, params=params,
+                                headers={"x-amz-access-token": token}, timeout=30)
+            if resp.status_code == 200:
+                break
+            if resp.status_code in (429, 503):
+                time.sleep(2 * (2 ** attempt))
+                continue
+            resp = None
+            break
+        if resp is None or resp.status_code != 200:
+            continue
+        try:
+            items = resp.json().get("items", [])
+        except ValueError:
+            continue
+        for it in items:
+            for blk in it.get("salesRanks", []) or []:
+                for rr in blk.get("classificationRanks", []) or []:
+                    if (str(rr.get("classificationId")) == node_id
+                            and isinstance(rr.get("rank"), int)):
+                        ranks.append(rr["rank"])
+        time.sleep(1.1)
+    if not ranks:
+        return None
+    return max(max(ranks), len(ranks))
 
 
 def classify(payload: dict, own_seller: str) -> str:
@@ -284,6 +401,52 @@ def sheet_update(token: str, sheet_id: str, rng: str, values: list[list]) -> Non
     r.raise_for_status()
 
 
+def _add_tab(token: str, sheet_id: str, title: str) -> None:
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}:batchUpdate"
+    r = requests.post(url, headers={"Authorization": f"Bearer {token}"},
+                      json={"requests": [{"addSheet": {"properties": {"title": title}}}]},
+                      timeout=30)
+    if r.status_code == 400 and "already exists" in r.text:
+        return
+    r.raise_for_status()
+
+
+def load_node_sizes(token: str, sheet_id: str) -> dict:
+    """ノードサイズタブ → {node_id: {"title","size","ts"}}。タブが無ければ作成して空。"""
+    try:
+        rows = sheet_get(token, sheet_id, f"'{NODE_TAB}'!A2:D")
+    except requests.HTTPError:
+        _add_tab(token, sheet_id, NODE_TAB)
+        sheet_update(token, sheet_id, f"'{NODE_TAB}'!A1:D1", [NODE_TAB_HEADER])
+        return {}
+    out = {}
+    for r in rows:
+        r = (r + [""] * 4)[:4]
+        nid = str(r[0]).strip()
+        if not nid:
+            continue
+        try:
+            size = int(str(r[2]).strip())
+        except ValueError:
+            size = None
+        ts = None
+        try:
+            ts = datetime.strptime(str(r[3]).strip(), "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+        except ValueError:
+            pass
+        out[nid] = {"title": str(r[1]).strip(), "size": size, "ts": ts}
+    return out
+
+
+def save_node_sizes(token: str, sheet_id: str, sizes: dict) -> None:
+    rows = [[nid, e.get("title") or "",
+             "" if e.get("size") is None else e["size"],
+             e["ts"].strftime("%Y-%m-%d %H:%M") if e.get("ts") else ""]
+            for nid, e in sorted(sizes.items())]
+    if rows:
+        sheet_update(token, sheet_id, f"'{NODE_TAB}'!A2:D{1 + len(rows)}", rows)
+
+
 # ── Chatwork ──────────────────────────────────────────────────────────────
 def chatwork_post(message: str) -> None:
     tok = _env("CHATWORK_TOKEN")
@@ -315,6 +478,30 @@ def main() -> int:
     inv = get_fba_inventory(token)   # {asin: 出荷可能数}（原因＝在庫切れ判定用）
     cat = get_catalog_all(token, [r[COL_ASIN].strip() for r in rows
                                   if r and len(r) > COL_ASIN and r[COL_ASIN].strip()])
+
+    # ベストセラータグ推定用: カテゴリ1位ASINのノード商品数（親ASIN単位）を計測。
+    # 計測は重い(数十コール/ノード)ため NODE_TAB に永続化し NODE_TTL_HOURS ごとに更新。
+    node_sizes = load_node_sizes(gtok, sheet_id)
+    need = {c["rank1_node"]: c.get("rank1_title") or ""
+            for c in cat.values() if c.get("rank1_node")}
+    now_dt = datetime.now(JST)
+    sizes_dirty = False
+    for nid, title in need.items():
+        ent = node_sizes.get(nid)
+        if ent and ent.get("size") is not None and ent.get("ts") and \
+                (now_dt - ent["ts"]) < timedelta(hours=NODE_TTL_HOURS):
+            continue
+        size = estimate_node_size(token, nid, title or (ent or {}).get("title", ""))
+        if size is None:
+            print(f"  [warn] node {nid}({title}): 商品数計測失敗→前回値を継続使用")
+            continue
+        node_sizes[nid] = {"title": title or (ent or {}).get("title", ""),
+                           "size": size, "ts": now_dt}
+        sizes_dirty = True
+        print(f"  [node] {nid}({title}): 推定商品数={size}")
+    if sizes_dirty:
+        save_node_sizes(gtok, sheet_id, node_sizes)
+
     now = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
     writes = []          # 各行の [F状態, G時刻, H相乗りID, Iベストセラー, Jバリ親, Kブラウズ]
     problems = []        # 通知ブロック（ASIN単位）
@@ -369,20 +556,54 @@ def main() -> int:
 
         # ベストセラー / バリエーション / ブラウズノード（Catalog）。
         # 初回(prev空)はbaseline記録のみ＝通知しない。
+        # 列I: TRUE=タグ推定(1位×ノード商品数>=100 or 表示グループ1位) /
+        #      RANK1=カテゴリ1位だがノード商品数<100でタグ対象外 / FALSE=1位でない。
         c = cat.get(asin)
-        best_event = var_event = browse_event = None
+        best_event = best_note = best_sev = None
+        var_event = browse_event = None
         if c is None:   # Catalog未取得 → I/J/K保持・イベント判定スキップ（誤検知防止）
             best_str, parents_now, browse_str = prev_best, (prev_parent or ""), prev_browse
         else:
-            best_now = bool(c.get("best"))
             parents_now = ",".join(c.get("parents") or []) or "なし"
-            best_str = "TRUE" if best_now else "FALSE"
             prev_b = prev_best.strip().upper()
-            if prev_b in ("TRUE", "FALSE"):
-                if best_now and prev_b == "FALSE":
-                    best_event = "ベストセラー点灯"
-                elif not best_now and prev_b == "TRUE":
-                    best_event = "ベストセラー消失"
+            nid = c.get("rank1_node")
+            nsize = (node_sizes.get(nid) or {}).get("size") if nid else None
+            if c.get("display_best"):
+                best_str = "TRUE"
+            elif nid and nsize is None:
+                # ノード商品数が未計測/計測失敗 → 判定保留（前回値保持・イベント無し）
+                best_str = prev_b if prev_b in ("TRUE", "FALSE", "RANK1") else ""
+            elif nid and nsize >= BSR_MIN_NODE_ITEMS:
+                best_str = "TRUE"
+            elif nid:
+                best_str = "RANK1"
+            else:
+                best_str = "FALSE"
+            if (prev_b in ("TRUE", "FALSE", "RANK1")
+                    and best_str in ("TRUE", "FALSE", "RANK1") and best_str != prev_b):
+                if best_str == "TRUE":
+                    best_event, best_sev = "ベストセラータグ点灯(推定)", "🏅"
+                    if c.get("display_best") and not (nid and nsize is not None
+                                                      and nsize >= BSR_MIN_NODE_ITEMS):
+                        best_note = f"表示グループ「{c.get('cat') or '—'}」で1位"
+                    else:
+                        best_note = (f"カテゴリ「{c.get('rank1_title') or '—'}」1位・"
+                                     f"ノード商品数{nsize}件（{BSR_MIN_NODE_ITEMS}件以上でタグ対象）")
+                elif best_str == "RANK1" and prev_b == "TRUE":
+                    best_event, best_sev = "ベストセラータグ対象外へ(1位維持)", "🔻"
+                    best_note = (f"カテゴリ「{c.get('rank1_title') or '—'}」1位は維持も、"
+                                 f"ノード商品数{nsize}件<{BSR_MIN_NODE_ITEMS}のためタグ非付与(推定)")
+                elif best_str == "RANK1":
+                    best_event, best_sev = "カテゴリ1位到達(タグ対象外)", "🟡"
+                    best_note = (f"カテゴリ「{c.get('rank1_title') or '—'}」で1位。ただし"
+                                 f"ノード商品数{nsize}件<{BSR_MIN_NODE_ITEMS}のためタグは"
+                                 f"付かない(推定)・あと{BSR_MIN_NODE_ITEMS - nsize}件で対象")
+                elif prev_b == "RANK1":
+                    best_event, best_sev = "カテゴリ1位から陥落", "🔻"
+                    best_note = f"カテゴリ1位から陥落（現順位 {c.get('rank') or '—'}）"
+                else:
+                    best_event, best_sev = "ベストセラー消失", "🔻"
+                    best_note = f"ベストセラー圏から外れました（現順位 {c.get('rank') or '—'}）"
             if prev_parent and prev_parent != "なし":
                 if parents_now == "なし":
                     var_event = "バリエーション解体"
@@ -416,10 +637,10 @@ def main() -> int:
         # 通知ブロック（ASIN単位）
         if any(i in ("カート喪失", "自社出品消失") for i in issues):
             sev = "🔴"
-        elif var_event or browse_event or best_event == "ベストセラー消失":
+        elif var_event or browse_event or best_sev == "🔻":
             sev = "🔻"
-        elif best_event == "ベストセラー点灯":
-            sev = "🏅"
+        elif best_sev:
+            sev = best_sev
         else:
             sev = "🟠"
         heads = list(issues) + [e for e in (best_event, var_event, browse_event) if e]
@@ -444,10 +665,8 @@ def main() -> int:
             block.append(f"  原因: 検索から抑制の可能性（購入は可・{errnote}）")
         if var_event:
             block.append(f"  ※バリエーション: 親 {prev_parent} → {parents_now}（レビュー/順位の統合に影響）")
-        if best_event == "ベストセラー点灯":
-            block.append(f"  ※カテゴリ「{c.get('cat') or '—'}」で1位（ベストセラー圏）")
-        elif best_event == "ベストセラー消失":
-            block.append(f"  ※ベストセラー圏から外れました（現順位 {c.get('rank') or '—'}）")
+        if best_note:
+            block.append(f"  ※{best_note}")
         if browse_event:
             block.append(f"  ※ブラウズノード: {prev_browse} → {browse_str}"
                          "（カテゴリ移動＝検索面/ベストセラー基準カテゴリ/サジェストに影響）")
@@ -486,7 +705,8 @@ def main() -> int:
                 + "\n".join(problems)
                 + "\n[hr]※セラー名はストアURLをクリックで確認。"
                   "カート落ち/検索対象外は解消かミュート(管理シート「アラート除外」TRUE)まで毎回通知。"
-                  "ベストセラー/バリエーション/ブラウズノードは変化時のみ。[/info]")
+                  "ベストセラー/バリエーション/ブラウズノードは変化時のみ。"
+                  "ベストセラータグ=カテゴリ1位×ノード商品数100件以上の推定。[/info]")
         chatwork_post(body)
         print(f"[alert] cart={n_cart} search={n_search} hijack={n_hijack} "
               f"best={n_best} var={n_var} browse={n_browse} ASIN={len(problems)} 通知")
