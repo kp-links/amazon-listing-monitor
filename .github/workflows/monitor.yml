@@ -64,6 +64,12 @@ jobs:
           OWN_SELLER_ID_SOLIA: ${{ secrets.OWN_SELLER_ID_SOLIA }}
           CHATWORK_ROOM_ID_SOLIA: ${{ secrets.CHATWORK_ROOM_ID_SOLIA }}
           SHEET_ID_SOLIA: ${{ secrets.SHEET_ID_SOLIA }}
+          # SP-API再認可期限（YYYY-MM-DD・Actions variables）。未設定の会社はリマインド無効。
+          # 無印フォールバックによる他社への誤通知を避けるため、テナント別のみ定義する。
+          REAUTH_DEADLINE_THIRDKNOWLEDGE: ${{ vars.REAUTH_DEADLINE_THIRDKNOWLEDGE }}
+          REAUTH_DEADLINE_NATURE: ${{ vars.REAUTH_DEADLINE_NATURE }}
+          REAUTH_DEADLINE_QIERA: ${{ vars.REAUTH_DEADLINE_QIERA }}
+          REAUTH_DEADLINE_SOLIA: ${{ vars.REAUTH_DEADLINE_SOLIA }}
         run: |
           END=$((SECONDS + 19800))   # 5h30m まで回す
           i=0

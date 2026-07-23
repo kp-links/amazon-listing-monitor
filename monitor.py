@@ -15,6 +15,10 @@ GitHub Actions で15分毎にクラウド実行（PCオフでも動く）。SP-A
                   復旧した最初の成功サイクルで「✅復旧」を通知。
   - 新商品同期  : 日次1回 searchListingsItems で出品一覧とシートを突合し、未登録のBUYABLE出品を
                   A:E列へ自動追記（商品名はAmazon商品名からの仮短縮名「…(仮)」・要人手修正）。
+  - 再認可期限  : SP-API認可は付与から365日で失効する。Actions variable REAUTH_DEADLINE_<TENANT>
+                  (YYYY-MM-DD) が設定されていれば、期限の60/30/14/7/3/2/1日前と当日以降毎日、
+                  [toall]付き高視認リマインドを日1回通知。トークンが実際に失効(invalid_grant)した
+                  場合はエラー通知を🚨認可失効の専用文言に格上げする。
 
 ※ 検索対象外(サーチ抑制だが購入可)の厳密検知は getListingsItem ベースの v1.1 で追加予定。
    本v1は「カート落ち（喪失/停止/相乗り）」を対象（最優先要件）。
@@ -66,6 +70,10 @@ NODE_TAB_HEADER = ["ノードID", "ノード名", "推定商品数(自動)", "�
 META_TAB = "監視メタ"          # 稼働確認/新商品同期の実施日などを保持するタブ（自動作成）
 META_TAB_HEADER = ["キー", "値", "更新(自動)"]
 
+# SP-API再認可期限リマインドを出す「残日数」の節目（当日以降は毎日）。
+# 期限日は public リポにコミットせず Actions variable REAUTH_DEADLINE_<TENANT> で注入する。
+REAUTH_MILESTONES = {60, 30, 14, 7, 3, 2, 1}
+
 # エラー通知の抑制間隔（継続エラー時の再通知間隔）。状態ファイルは同一Actionsジョブ内
 # (~5.5h)で持続し、ジョブ再起動で消える＝最悪1回だけ余分に通知される（許容）。
 ERR_NOTIFY_INTERVAL_SEC = 3600
@@ -109,6 +117,10 @@ def lwa_token() -> str:
         "client_id": _env("SPAPI_LWA_CLIENT_ID"),
         "client_secret": _env("SPAPI_LWA_CLIENT_SECRET"),
     }, timeout=30)
+    if r.status_code == 400 and "invalid_grant" in r.text:
+        raise RuntimeError(
+            "SP-API認可失効(invalid_grant): refresh_tokenが無効です。セラー側の認可取消または"
+            "365日期限切れの可能性。再連携（ワンクリック認可URL再発行→認可→secrets差替）が必要")
     r.raise_for_status()
     return r.json()["access_token"]
 
@@ -637,11 +649,22 @@ def _notify_error(detail: str) -> None:
         print(f"[error] 通知は{ERR_NOTIFY_INTERVAL_SEC // 60}分間隔に抑制中"
               f"（前回 {now.timestamp() - last:.0f}秒前）: {detail[:200]}")
         return
-    body = (f"[info][title]🔴 カート監視エラー（{_tenant_label()}） {now:%Y-%m-%d %H:%M}[/title]\n"
-            f"監視サイクルが失敗し、データ取得/シート更新が止まっています。\n"
-            f"原因: {detail[:300]}\n"
-            f"[hr]解消まで{ERR_NOTIFY_INTERVAL_SEC // 60}分毎に再通知します。"
-            "復旧すると✅を通知します。[/info]")
+    if "invalid_grant" in detail:
+        # 認可失効はデータ取得の全停止＝最重要。[toall]+🚨で格上げ通知する。
+        body = ("[toall]\n"
+                f"[info][title]🚨【超重要】SP-API認可 失効（{_tenant_label()}） "
+                f"{now:%Y-%m-%d %H:%M}[/title]\n"
+                "Amazon連携の認可が失効し、カート監視・データ取得がすべて停止しています。\n"
+                "復旧には再連携が必要です（ワンクリック認可URLの再発行→セラーセントラルで認可）。\n"
+                "[hr]💡 対応: このメッセージを見たら滝谷さんへ至急ご連絡ください。\n"
+                f"[hr]解消まで{ERR_NOTIFY_INTERVAL_SEC // 60}分毎に再通知します。"
+                "復旧すると✅を通知します。[/info]")
+    else:
+        body = (f"[info][title]🔴 カート監視エラー（{_tenant_label()}） {now:%Y-%m-%d %H:%M}[/title]\n"
+                f"監視サイクルが失敗し、データ取得/シート更新が止まっています。\n"
+                f"原因: {detail[:300]}\n"
+                f"[hr]解消まで{ERR_NOTIFY_INTERVAL_SEC // 60}分毎に再通知します。"
+                "復旧すると✅を通知します。[/info]")
     try:
         chatwork_post(body)
         with open(path, "w", encoding="utf-8") as f:
@@ -669,6 +692,60 @@ def _notify_recovery_if_needed() -> None:
         pass
 
 
+# ── SP-API再認可期限リマインド ────────────────────────────────────────────
+def notify_reauth_deadline(gtok: str, sheet_id: str, meta: dict) -> None:
+    """再認可期限の高視認リマインド（節目日と期限当日以降は毎日・日1回）。
+
+    期限は Actions variable REAUTH_DEADLINE_<TENANT>（YYYY-MM-DD）。未設定なら何もしない。
+    無印フォールバックでの他社誤通知を避けるため _env を使わずテナント別のみ読む。
+    通知失敗時は実施日を更新せず次サイクル(15分後)で再試行される（fail-soft）。"""
+    raw = os.getenv(f"REAUTH_DEADLINE_{_tenant_label().upper()}", "")
+    if not raw:
+        return
+    try:
+        deadline = datetime.strptime(raw.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        print(f"  [warn] REAUTH_DEADLINE が YYYY-MM-DD 形式でない: {raw}")
+        return
+    today = datetime.now(JST).date()
+    days = (deadline - today).days
+    if days > 0 and days not in REAUTH_MILESTONES:
+        return
+    if meta.get("reauth_notice_last_date") == today.strftime("%Y-%m-%d"):
+        return
+    if days > 0:
+        title = f"⏰【超重要】SP-API再認可期限 あと{days}日（{_tenant_label()}）"
+        lead = (f"Amazon連携の認可期限: {deadline:%Y-%m-%d}\n"
+                "期限を過ぎるとカート監視・売上/在庫データ取得がすべて停止します。")
+        steps = ("💡 対応（期限前ならボタンを押すだけ・約1分）\n"
+                 "1️⃣ セラーセントラルにログイン\n"
+                 "2️⃣ 設定 → アプリの管理（Manage Your Apps）を開く\n"
+                 "3️⃣ 「KeyPath_AI_amazon」の「再承認」を押す\n"
+                 "[hr]✅ 完了したら滝谷さんへ一報ください（期限の更新登録を行います）")
+    elif days == 0:
+        title = f"🚨【超重要】SP-API再認可期限 本日まで（{_tenant_label()}）"
+        lead = (f"Amazon連携の認可期限が本日（{deadline:%Y-%m-%d}）です。\n"
+                "本日中に再承認しないとカート監視・データ取得がすべて停止します。")
+        steps = ("💡 対応（本日中・約1分）\n"
+                 "1️⃣ セラーセントラルにログイン\n"
+                 "2️⃣ 設定 → アプリの管理（Manage Your Apps）を開く\n"
+                 "3️⃣ 「KeyPath_AI_amazon」の「再承認」を押す\n"
+                 "[hr]✅ 完了したら滝谷さんへ一報ください")
+    else:
+        title = f"🚨【超重要】SP-API認可 期限超過{-days}日（{_tenant_label()}）"
+        lead = (f"Amazon連携の認可期限（{deadline:%Y-%m-%d}）を過ぎています。\n"
+                "認可が失効している場合、カート監視・データ取得が止まっています。")
+        steps = "💡 対応: 再連携が必要な可能性があります。滝谷さんへ至急ご連絡ください"
+    body = f"[toall]\n[info][title]{title}[/title]\n{lead}\n[hr]{steps}[/info]"
+    try:
+        chatwork_post(body)
+        meta["reauth_notice_last_date"] = today.strftime("%Y-%m-%d")
+        save_meta(gtok, sheet_id, meta)
+        print(f"[reauth] 再認可期限リマインド通知（期限 {deadline} / 残{days}日）")
+    except Exception as e:
+        print(f"  [warn] 再認可リマインド通知失敗（次サイクルで再試行）: {e}")
+
+
 # ── メイン ────────────────────────────────────────────────────────────────
 def main() -> int:
     global _TENANT
@@ -683,6 +760,10 @@ def main() -> int:
     sheet_update(gtok, sheet_id, "A1:K1", [HEADER])
 
     meta = load_meta(gtok, sheet_id)
+
+    # SP-API再認可期限リマインド。トークン失効後も出せるよう lwa_token() より先に実施。
+    notify_reauth_deadline(gtok, sheet_id, meta)
+
     token = lwa_token()
 
     # 0) 新商品の自動追記（日次1回）: 出品一覧とシートを突合し未登録のBUYABLE出品をA:E列へ追加。
