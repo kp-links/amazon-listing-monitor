@@ -15,6 +15,15 @@ Amazon の **カート喪失 / 自社出品消失(停止) / 検索対象外 / �
 - 15分毎の起動は**外部cron（cron-job.org 等）→ GitHub `workflow_dispatch` API**で行う
   （GitHub内蔵cronは遅延/スキップが大きく15分を満たせないため不使用）。
 
+## 運用系の通知（2026-07-23追加）
+- **稼働確認**: 毎朝9時台の最初の成功サイクルで「✅正常稼働」を日1回通知
+  （監視件数・ミュート数・現在の異常数をシート実カウントで併記）。
+- **エラー即時通知**: サイクル失敗（トークン/シート/API致命）は即Chatworkへ通知。
+  継続エラーは60分間隔に抑制し、復旧した最初の成功サイクルで「✅復旧」を通知。
+- **新商品の自動追記**: 日次1回 `searchListingsItems` で出品一覧と管理シートを突合し、
+  未登録のBUYABLE出品をA:E列へ自動追加（商品名はAmazon商品名からの仮短縮名「…(仮)」・要人手修正。
+  廃盤/停止中の出品は追加しない）。実施状態は管理シートの「監視メタ」タブ（自動作成）に保持。
+
 ## Secrets（Settings → Secrets and variables → Actions）
 SPAPI_REFRESH_TOKEN / SPAPI_LWA_CLIENT_ID / SPAPI_LWA_CLIENT_SECRET /
 SPAPI_MARKETPLACE_ID / SPAPI_HOST / OWN_SELLER_ID /

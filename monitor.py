@@ -9,6 +9,13 @@ GitHub Actions で15分毎にクラウド実行（PCオフでも動く）。SP-A
 「アラート除外」=TRUE のASINは通知しない（ミュート）。
 カート喪失/自社出品消失は未解決の間、ミュートまで毎回(15分毎)通知し続ける。相乗りは新規セラー出現時のみ通知。
 
+運用系の通知（2026-07-23追加）:
+  - 稼働確認    : 毎朝9時台の最初の成功サイクルで「✅正常稼働」を日1回通知（シート実カウント併記）。
+  - エラー即時  : サイクル失敗（トークン/シート/API致命）は即Chatwork通知。継続中は60分間隔に抑制し、
+                  復旧した最初の成功サイクルで「✅復旧」を通知。
+  - 新商品同期  : 日次1回 searchListingsItems で出品一覧とシートを突合し、未登録のBUYABLE出品を
+                  A:E列へ自動追記（商品名はAmazon商品名からの仮短縮名「…(仮)」・要人手修正）。
+
 ※ 検索対象外(サーチ抑制だが購入可)の厳密検知は getListingsItem ベースの v1.1 で追加予定。
    本v1は「カート落ち（喪失/停止/相乗り）」を対象（最優先要件）。
 
@@ -23,8 +30,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
+import traceback
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
@@ -53,6 +62,13 @@ BSR_MIN_NODE_ITEMS = 100
 NODE_TAB = "ノードサイズ"      # ノード商品数キャッシュ用タブ（自動作成）
 NODE_TTL_HOURS = 24            # 商品数の再計測間隔（計測は数十APIコールかかるため日次）
 NODE_TAB_HEADER = ["ノードID", "ノード名", "推定商品数(自動)", "最終計測(自動)"]
+
+META_TAB = "監視メタ"          # 稼働確認/新商品同期の実施日などを保持するタブ（自動作成）
+META_TAB_HEADER = ["キー", "値", "更新(自動)"]
+
+# エラー通知の抑制間隔（継続エラー時の再通知間隔）。状態ファイルは同一Actionsジョブ内
+# (~5.5h)で持続し、ジョブ再起動で消える＝最悪1回だけ余分に通知される（許容）。
+ERR_NOTIFY_INTERVAL_SEC = 3600
 
 # ステータス定義（severityで通知要否を判定）
 ST_OK = "正常"
@@ -363,6 +379,127 @@ def estimate_node_size(token: str, node_id: str, title: str) -> int | None:
     return max(max(ranks), len(ranks))
 
 
+def list_all_listings(token: str, seller: str) -> list | None:
+    """searchListingsItems でセラーの全出品を列挙 → [{sku, asin, title, buyable}]。失敗は None。
+
+    20件/頁で最大60頁（1200 SKU）。ページ取得が途中で失敗した場合も None
+    （部分リストで差分判定すると誤追記しないが取りこぼすため、全量成功時のみ使う）。"""
+    host = _env("SPAPI_HOST")
+    mp = _env("SPAPI_MARKETPLACE_ID")
+    url = f"https://{host}/listings/2021-08-01/items/{seller}"
+    out: list = []
+    page_token = None
+    for _page in range(60):
+        params = {"marketplaceIds": mp, "pageSize": 20, "includedData": "summaries"}
+        if page_token:
+            params["pageToken"] = page_token
+        resp = None
+        for attempt in range(4):
+            resp = requests.get(url, params=params,
+                                headers={"x-amz-access-token": token}, timeout=30)
+            if resp.status_code == 200:
+                break
+            if resp.status_code in (429, 503):
+                time.sleep(2 * (2 ** attempt))
+                continue
+            print(f"  [warn] 出品一覧 HTTP {resp.status_code} {resp.text[:120]}")
+            return None
+        if resp is None or resp.status_code != 200:
+            return None
+        try:
+            j = resp.json()
+        except ValueError:
+            print("  [warn] 出品一覧 JSON parse失敗")
+            return None
+        for it in j.get("items", []) or []:
+            summaries = it.get("summaries") or []
+            summ = next((s for s in summaries if s.get("marketplaceId") == mp),
+                        summaries[0] if summaries else {})
+            out.append({"sku": str(it.get("sku") or ""),
+                        "asin": str(summ.get("asin") or ""),
+                        "title": str(summ.get("itemName") or ""),
+                        "buyable": "BUYABLE" in (summ.get("status") or [])})
+        page_token = (j.get("pagination") or {}).get("nextToken") or j.get("nextToken")
+        if not page_token:
+            break
+        time.sleep(0.3)
+    else:
+        # 60頁(1200 SKU)取り切れず途中終了＝部分リスト。成功扱いにすると当日中の
+        # 差分検出を取りこぼすため失敗として返し、次サイクルで再試行させる。
+        print(f"  [warn] 出品一覧が上限{len(out)}件で未完（nextToken残あり）→失敗扱い")
+        return None
+    return out
+
+
+def tentative_short_name(title: str) -> str:
+    """Amazonフル商品名 → 仮の短縮商品名（B列用・人手修正前提で「(仮)」を付す）。
+
+    【】/[]の販促ブロックと括弧・区切り記号を除去し、先頭の実語（短ければ2語連結）
+    を最大20文字＋容量表記（30日分/90粒 等）で構成する。"""
+    if not title:
+        return "(名称不明)(仮)"
+    # 容量表記は「期間・個数系」を「成分量系(mg等)」より優先して拾う（例: 60粒 > 1000mg）
+    m = (re.search(r"(\d+(?:\.\d+)?\s*(?:日分|ヶ月分|か月分|粒|袋|包|回分|錠|本|個))", title)
+         or re.search(r"(\d+(?:\.\d+)?\s*(?:mg|g|ml|mL|kg))", title))
+    cap = re.sub(r"\s+", "", m.group(1)) if m else ""
+    t = re.sub(r"【[^】]*】|\[[^\]]*\]", " ", title)
+    t = re.sub(r"[（）()「」『』〈〉《》｜|/／,、。・×]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    parts = [p for p in t.split(" ") if p]
+    base = parts[0] if parts else title.strip()
+    if len(base) < 6 and len(parts) > 1:
+        base = base + parts[1]
+    base = base[:20]
+    if cap and cap not in base:
+        base = f"{base} {cap}"
+    return base + "(仮)"
+
+
+def sync_new_listings(gtok: str, sheet_id: str, token: str, seller: str) -> int:
+    """出品一覧とシートを突合し、未登録のBUYABLE出品をA:E列へ自動追記。
+
+    返り値: 追記件数（0=新規なし）／-1=出品一覧の取得失敗（呼び出し側で当日中に再試行）。
+    既知ASIN/SKUのいずれかに一致すればスキップ（同一ASINの複数SKUは1行に集約）。
+    廃盤・出品停止（BUYABLEでない）出品は追加しない。"""
+    listings = list_all_listings(token, seller)
+    if listings is None:
+        print("  [warn] 新商品同期: 出品一覧の取得失敗→次サイクルで再試行")
+        return -1
+    rows = sheet_get(gtok, sheet_id, "A2:C")
+    known_asins = {str(r[0]).strip() for r in rows if r and str(r[0]).strip()}
+    known_skus = {str(r[2]).strip() for r in rows if len(r) > 2 and str(r[2]).strip()}
+    new = [l for l in listings
+           if l["buyable"] and l["asin"] and l["sku"]
+           and l["asin"] not in known_asins and l["sku"] not in known_skus]
+    seen: set = set()
+    uniq = []
+    for l in sorted(new, key=lambda x: x["sku"]):
+        if l["asin"] in seen:
+            continue
+        seen.add(l["asin"])
+        uniq.append(l)
+    print(f"  [sync] 出品{len(listings)}件 / シート既登録{len(rows)}行 / 新規{len(uniq)}件")
+    if not uniq:
+        return 0
+    today = datetime.now(JST).strftime("%Y-%m-%d")
+    add_rows = [[l["asin"], tentative_short_name(l["title"]), l["sku"], "FALSE",
+                 f"自動追加{today}・仮名要修正"] for l in uniq]
+    start = 2 + len(rows)
+    sheet_update(gtok, sheet_id, f"A{start}:E{start + len(add_rows) - 1}", add_rows)
+    lines = [f"・{r[0]} {r[1]}（SKU: {r[2]}）" for r in add_rows[:20]]
+    if len(add_rows) > 20:
+        lines.append(f"…他{len(add_rows) - 20}件")
+    body = (f"[info][title]📦 新商品を監視シートへ自動追加（{_tenant_label()}） {today}[/title]\n"
+            + "\n".join(lines)
+            + "\n[hr]商品名はAmazon商品名からの仮短縮名です。管理シートB列を確認・修正してください。"
+              "アラート除外=FALSE（監視対象）で追加済み。[/info]")
+    try:
+        chatwork_post(body)
+    except Exception as e:   # 追記自体は完了済み。通知失敗は握らず記録のみ（fail-loud）
+        print(f"  [warn] 新商品追加の通知失敗（シート追記は完了）: {e}")
+    return len(add_rows)
+
+
 def classify(payload: dict, own_seller: str) -> str:
     """getItemOffers payload → ステータス文字列。"""
     if not payload or payload.get("_notfound"):
@@ -447,6 +584,25 @@ def save_node_sizes(token: str, sheet_id: str, sizes: dict) -> None:
         sheet_update(token, sheet_id, f"'{NODE_TAB}'!A2:D{1 + len(rows)}", rows)
 
 
+def load_meta(token: str, sheet_id: str) -> dict:
+    """監視メタタブ → {キー: 値}。タブが無ければ作成して空を返す。"""
+    try:
+        rows = sheet_get(token, sheet_id, f"'{META_TAB}'!A2:B")
+    except requests.HTTPError:
+        _add_tab(token, sheet_id, META_TAB)
+        sheet_update(token, sheet_id, f"'{META_TAB}'!A1:C1", [META_TAB_HEADER])
+        return {}
+    return {str(r[0]).strip(): (str(r[1]).strip() if len(r) > 1 else "")
+            for r in rows if r and str(r[0]).strip()}
+
+
+def save_meta(token: str, sheet_id: str, meta: dict) -> None:
+    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
+    rows = [[k, meta[k], now] for k in sorted(meta)]
+    if rows:
+        sheet_update(token, sheet_id, f"'{META_TAB}'!A2:C{1 + len(rows)}", rows)
+
+
 # ── Chatwork ──────────────────────────────────────────────────────────────
 def chatwork_post(message: str) -> None:
     tok = _env("CHATWORK_TOKEN")
@@ -455,6 +611,62 @@ def chatwork_post(message: str) -> None:
                       headers={"X-ChatWorkToken": tok},
                       data={"body": message, "self_unread": "1"}, timeout=30)
     r.raise_for_status()
+
+
+# ── エラー即時通知 / 復旧通知 ─────────────────────────────────────────────
+def _tenant_label() -> str:
+    return _TENANT or "thirdknowledge"
+
+
+def _err_state_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        f".errnotify_{_tenant_label()}")
+
+
+def _notify_error(detail: str) -> None:
+    """サイクル失敗をChatworkへ即時通知。継続エラーは ERR_NOTIFY_INTERVAL_SEC 間隔に抑制。"""
+    now = datetime.now(JST)
+    path = _err_state_path()
+    last = 0.0
+    try:
+        with open(path, encoding="utf-8") as f:
+            last = float(f.read().strip() or 0)
+    except (OSError, ValueError):
+        pass
+    if now.timestamp() - last < ERR_NOTIFY_INTERVAL_SEC:
+        print(f"[error] 通知は{ERR_NOTIFY_INTERVAL_SEC // 60}分間隔に抑制中"
+              f"（前回 {now.timestamp() - last:.0f}秒前）: {detail[:200]}")
+        return
+    body = (f"[info][title]🔴 カート監視エラー（{_tenant_label()}） {now:%Y-%m-%d %H:%M}[/title]\n"
+            f"監視サイクルが失敗し、データ取得/シート更新が止まっています。\n"
+            f"原因: {detail[:300]}\n"
+            f"[hr]解消まで{ERR_NOTIFY_INTERVAL_SEC // 60}分毎に再通知します。"
+            "復旧すると✅を通知します。[/info]")
+    try:
+        chatwork_post(body)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(now.timestamp()))
+        print(f"[error] Chatworkへエラー通知済み: {detail[:120]}")
+    except BaseException as ce:   # 通知経路自体の死(トークン未設定等)もログには必ず残す
+        print(f"[error] エラー通知自体が失敗: {ce} / 元エラー: {detail[:200]}")
+
+
+def _notify_recovery_if_needed() -> None:
+    """直前までエラー通知していた場合のみ、復旧をChatworkへ通知して状態を消す。"""
+    path = _err_state_path()
+    if not os.path.exists(path):
+        return
+    try:
+        chatwork_post(f"[info][title]✅ カート監視 復旧（{_tenant_label()}） "
+                      f"{datetime.now(JST):%Y-%m-%d %H:%M}[/title]\n"
+                      "監視サイクルが正常に完了しました。エラーは解消しています。[/info]")
+    except Exception as ce:
+        print(f"  [warn] 復旧通知失敗（次の成功サイクルで再試行）: {ce}")
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # ── メイン ────────────────────────────────────────────────────────────────
@@ -470,11 +682,24 @@ def main() -> int:
     # ヘッダを設定
     sheet_update(gtok, sheet_id, "A1:K1", [HEADER])
 
-    # 1) シート読込（ヘッダ除く）＝監視対象の正本。新規ASINはシートに手動で行追加する。
+    meta = load_meta(gtok, sheet_id)
+    token = lwa_token()
+
+    # 0) 新商品の自動追記（日次1回）: 出品一覧とシートを突合し未登録のBUYABLE出品をA:E列へ追加。
+    #    失敗時は実施日を更新せず次サイクルで再試行（fail-soft・当日中はリトライされ続ける）。
+    today = datetime.now(JST).strftime("%Y-%m-%d")
+    if meta.get("listing_sync_last_date") != today:
+        try:
+            if sync_new_listings(gtok, sheet_id, token, own_seller) >= 0:
+                meta["listing_sync_last_date"] = today
+                save_meta(gtok, sheet_id, meta)
+        except Exception as e:
+            print(f"  [warn] 新商品同期失敗（次サイクルで再試行）: {e}")
+
+    # 1) シート読込（ヘッダ除く）＝監視対象の正本。新規ASINは日次自動追記または手動行追加。
     rows = sheet_get(gtok, sheet_id, "A2:K")
 
     # 2) 各ASINを判定
-    token = lwa_token()
     inv = get_fba_inventory(token)   # {asin: 出荷可能数}（原因＝在庫切れ判定用）
     cat = get_catalog_all(token, [r[COL_ASIN].strip() for r in rows
                                   if r and len(r) > COL_ASIN and r[COL_ASIN].strip()])
@@ -506,6 +731,7 @@ def main() -> int:
     writes = []          # 各行の [F状態, G時刻, H相乗りID, Iベストセラー, Jバリ親, Kブラウズ]
     problems = []        # 通知ブロック（ASIN単位）
     n_cart = n_search = n_hijack = n_best = n_var = n_browse = 0
+    n_asin = n_mute = n_unk = n_bad = 0     # 稼働確認通知用の実カウント
     for r in rows:
         r = (r + [""] * 11)[:11]
         asin = r[COL_ASIN].strip()
@@ -513,16 +739,19 @@ def main() -> int:
             writes.append([r[COL_STATUS], r[COL_CHECK], r[COL_SELLERS], r[COL_BEST],
                            r[COL_PARENT], r[COL_BROWSE]])
             continue
+        n_asin += 1
         sku, name = r[COL_SKU].strip(), r[COL_NAME].strip()
         muted = str(r[COL_MUTE]).strip().upper() in ("TRUE", "1", "YES", "✓")
         prev_sellers = {s.strip() for s in str(r[COL_SELLERS]).split(",") if s.strip()}
         prev_best, prev_parent = r[COL_BEST].strip(), r[COL_PARENT].strip()
         prev_browse = r[COL_BROWSE].strip()
         if muted:
+            n_mute += 1
             writes.append([ST_MUTED, now, r[COL_SELLERS], r[COL_BEST], r[COL_PARENT], r[COL_BROWSE]])
             continue
         payload = get_item_offers(token, asin)
         if payload is None:
+            n_unk += 1
             writes.append([r[COL_STATUS] or "判定不可", now, r[COL_SELLERS], r[COL_BEST],
                            r[COL_PARENT], r[COL_BROWSE]])
             time.sleep(0.6)
@@ -627,6 +856,8 @@ def main() -> int:
 
         status_parts = list(issues) + (["相乗りあり"] if others else [])
         status_str = "／".join(status_parts) if status_parts else ST_OK
+        if status_str != ST_OK:
+            n_bad += 1
         writes.append([status_str, now, ",".join(others), best_str, parents_now, browse_str])
 
         new_sellers = [s for s in others if s not in prev_sellers]
@@ -712,14 +943,63 @@ def main() -> int:
               f"best={n_best} var={n_var} browse={n_browse} ASIN={len(problems)} 通知")
     else:
         print("[ok] 新規異常なし")
+
+    # 5) 毎朝9時台の稼働確認（日1回・サイクル成功時のみ＝失敗時は _notify_error が担う）。
+    #    プロセス生存でなく「シート書込まで完了した実カウント」で報告する。
+    end_dt = datetime.now(JST)
+    if end_dt.hour >= 9 and meta.get("health_last_date") != end_dt.strftime("%Y-%m-%d"):
+        late = end_dt.hour >= 10   # 9時台に出せなかった（朝の失敗/ジョブ遅延後の遅延発信）
+        title = ("✅ カート監視 正常稼働" if not late
+                 else "✅ カート監視 稼働確認（遅延発信）")
+        note = ("毎朝9時台の稼働確認通知です。"
+                if not late else
+                "本日9時台は稼働確認を出せませんでした（朝のエラー/遅延の可能性）。"
+                "現時点のサイクルは正常です。")
+        body = (f"[info][title]{title}（{_tenant_label()}） "
+                f"{end_dt:%Y-%m-%d %H:%M}[/title]\n"
+                "監視サイクルはエラーなく完了し、管理シートも更新済みです。\n"
+                f"監視対象: {n_asin}件（うちミュート{n_mute}件）\n"
+                f"現在の異常: {n_bad}件"
+                + (f"（別途 判定不可{n_unk}件）" if n_unk else "")
+                + f"\n[hr]{note}"
+                  "朝にこの✅が無い場合は監視停止の可能性があるためご連絡ください。[/info]")
+        try:
+            chatwork_post(body)
+            meta["health_last_date"] = end_dt.strftime("%Y-%m-%d")
+            save_meta(gtok, sheet_id, meta)
+            print("[health] 稼働確認を通知")
+        except Exception as e:
+            print(f"  [warn] 稼働確認通知失敗（次サイクルで再試行）: {e}")
     return 0
 
 
+def run() -> int:
+    """main() を実行し、失敗時は Chatwork へ即時エラー通知（継続中は60分間隔に抑制）。
+
+    成功時は、直前までエラー通知していた場合のみ✅復旧を通知する。
+    _env 未設定の sys.exit（SystemExit）も「データ取得できない」状態として通知対象。"""
+    global _TENANT
+    _TENANT = (sys.argv[1].strip() if len(sys.argv) > 1 else "")
+    try:
+        rc = main()
+    except KeyboardInterrupt:
+        raise
+    except BaseException as e:
+        if isinstance(e, SystemExit) and (e.code is None or e.code == 0):
+            _notify_recovery_if_needed()
+            return 0
+        traceback.print_exc()
+        _notify_error(str(e) or type(e).__name__)
+        return 1
+    _notify_recovery_if_needed()
+    return rc
+
+
 def handler(request=None):
-    """Cloud Functions(2nd gen, HTTP) / Cloud Scheduler 用エントリ。main()を実行。"""
-    rc = main()
+    """Cloud Functions(2nd gen, HTTP) / Cloud Scheduler 用エントリ。run()を実行。"""
+    rc = run()
     return (f"done rc={rc}", 200)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run())

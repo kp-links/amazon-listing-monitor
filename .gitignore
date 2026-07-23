@@ -7,3 +7,4 @@ credentials*.json
 google_credentials*.json
 .streamlit/
 check_state.py
+.errnotify_*
