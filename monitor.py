@@ -652,12 +652,13 @@ def _notify_error(detail: str) -> None:
     if "invalid_grant" in detail:
         # 認可失効はデータ取得の全停止＝最重要。[toall]+🚨で格上げ通知する。
         body = ("[toall]\n"
-                f"[info][title]🚨【超重要】SP-API認可 失効（{_tenant_label()}） "
-                f"{now:%Y-%m-%d %H:%M}[/title]\n"
-                "Amazon連携の認可が失効し、カート監視・データ取得がすべて停止しています。\n"
-                "復旧には再連携が必要です（ワンクリック認可URLの再発行→セラーセントラルで認可）。\n"
-                "[hr]💡 対応: このメッセージを見たら滝谷さんへ至急ご連絡ください。\n"
-                f"[hr]解消まで{ERR_NOTIFY_INTERVAL_SEC // 60}分毎に再通知します。"
+                f"[info][title]🚨🚨🚨【超重要】SP-API認可 失効（{_tenant_label()}） "
+                f"{now:%Y-%m-%d %H:%M} 🚨🚨🚨[/title]\n"
+                "🚨‼️🚨‼️🚨‼️🚨‼️🚨‼️🚨‼️🚨\n"
+                "⛔ Amazon連携の認可が失効し、カート監視・データ取得がすべて停止しています。\n"
+                "🔧 復旧には再連携が必要です（ワンクリック認可URLの再発行→セラーセントラルで認可）。\n"
+                "[hr]📞 対応: このメッセージを見たら滝谷へ至急ご連絡ください。\n"
+                f"[hr]🔁 解消まで{ERR_NOTIFY_INTERVAL_SEC // 60}分毎に再通知します。"
                 "復旧すると✅を通知します。[/info]")
     else:
         body = (f"[info][title]🔴 カート監視エラー（{_tenant_label()}） {now:%Y-%m-%d %H:%M}[/title]\n"
@@ -713,29 +714,34 @@ def notify_reauth_deadline(gtok: str, sheet_id: str, meta: dict) -> None:
         return
     if meta.get("reauth_notice_last_date") == today.strftime("%Y-%m-%d"):
         return
+    siren = "🚨‼️🚨‼️🚨‼️🚨‼️🚨‼️🚨‼️🚨"   # 視認性最優先の警報ライン（Chatworkはmd非描画のため絵文字で強調）
     if days > 0:
-        title = f"⏰【超重要】SP-API再認可期限 あと{days}日（{_tenant_label()}）"
-        lead = (f"Amazon連携の認可期限: {deadline:%Y-%m-%d}\n"
-                "期限を過ぎるとカート監視・売上/在庫データ取得がすべて停止します。")
+        title = f"🚨⏰【超重要】SP-API再認可期限 あと{days}日（{_tenant_label()}）⏰🚨"
+        lead = (f"{siren}\n"
+                f"🗓️ Amazon連携の認可期限: {deadline:%Y-%m-%d}\n"
+                f"⏳ 残り {days}日\n"
+                "⛔ 期限を過ぎるとカート監視・売上/在庫データ取得がすべて停止します。")
         steps = ("💡 対応（期限前ならボタンを押すだけ・約1分）\n"
                  "1️⃣ セラーセントラルにログイン\n"
                  "2️⃣ 設定 → アプリの管理（Manage Your Apps）を開く\n"
                  "3️⃣ 「KeyPath_AI_amazon」の「再承認」を押す\n"
-                 "[hr]✅ 完了したら滝谷さんへ一報ください（期限の更新登録を行います）")
+                 "[hr]✅ 完了したら滝谷へ一報ください（期限の更新登録を行います）")
     elif days == 0:
-        title = f"🚨【超重要】SP-API再認可期限 本日まで（{_tenant_label()}）"
-        lead = (f"Amazon連携の認可期限が本日（{deadline:%Y-%m-%d}）です。\n"
-                "本日中に再承認しないとカート監視・データ取得がすべて停止します。")
+        title = f"🚨🚨🚨【超重要】SP-API再認可期限 本日まで（{_tenant_label()}）🚨🚨🚨"
+        lead = (f"{siren}\n"
+                f"🗓️ Amazon連携の認可期限: 本日 {deadline:%Y-%m-%d}\n"
+                "⛔ 本日中に再承認しないとカート監視・データ取得がすべて停止します。")
         steps = ("💡 対応（本日中・約1分）\n"
                  "1️⃣ セラーセントラルにログイン\n"
                  "2️⃣ 設定 → アプリの管理（Manage Your Apps）を開く\n"
                  "3️⃣ 「KeyPath_AI_amazon」の「再承認」を押す\n"
-                 "[hr]✅ 完了したら滝谷さんへ一報ください")
+                 "[hr]✅ 完了したら滝谷へ一報ください")
     else:
-        title = f"🚨【超重要】SP-API認可 期限超過{-days}日（{_tenant_label()}）"
-        lead = (f"Amazon連携の認可期限（{deadline:%Y-%m-%d}）を過ぎています。\n"
-                "認可が失効している場合、カート監視・データ取得が止まっています。")
-        steps = "💡 対応: 再連携が必要な可能性があります。滝谷さんへ至急ご連絡ください"
+        title = f"🚨🚨🚨【超重要】SP-API認可 期限超過{-days}日（{_tenant_label()}）🚨🚨🚨"
+        lead = (f"{siren}\n"
+                f"🗓️ Amazon連携の認可期限: {deadline:%Y-%m-%d}（⌛超過{-days}日）\n"
+                "⛔ 認可が失効している場合、カート監視・データ取得が止まっています。")
+        steps = "📞 対応: 再連携が必要な可能性があります。滝谷へ至急ご連絡ください"
     body = f"[toall]\n[info][title]{title}[/title]\n{lead}\n[hr]{steps}[/info]"
     try:
         chatwork_post(body)
