@@ -9,10 +9,13 @@ GitHub Actions で15分毎にクラウド実行（PCオフでも動く）。SP-A
 「アラート除外」=TRUE のASINは通知しない（ミュート）。
 カート喪失/自社出品消失は未解決の間、ミュートまで毎回(15分毎)通知し続ける。相乗りは新規セラー出現時のみ通知。
 
-運用系の通知（2026-07-23追加）:
-  - 稼働確認    : 毎朝9時台の最初の成功サイクルで「✅正常稼働」を日1回通知（シート実カウント併記）。
-  - エラー即時  : サイクル失敗（トークン/シート/API致命）は即Chatwork通知。継続中は60分間隔に抑制し、
-                  復旧した最初の成功サイクルで「✅復旧」を通知。
+運用系の通知（2026-07-23追加・2026-08-05改定）:
+  - エラー通知  : サイクル失敗（トークン/シート/API致命）が3回連続した時のみChatwork通知
+                  （単発の一時失敗では鳴らさない）。継続中は60分間隔に抑制し、通知済みエラーが
+                  復旧した最初の成功サイクルで「✅復旧」を通知。認可失効(invalid_grant)のみ
+                  自然復旧が無いため1回目から即通知。
+                  ※毎朝の「✅正常稼働」通知は2026-08-05に廃止（正常時は無通知。
+                    Actionsごと停止した場合はCF Worker cart-monitor-dispatcher のwatchdogが検知）。
   - 新商品同期  : 日次1回 searchListingsItems で出品一覧とシートを突合し、未登録のBUYABLE出品を
                   A:E列へ自動追記（商品名はAmazon商品名からの仮短縮名「…(仮)」・要人手修正）。
   - 再認可期限  : SP-API認可は付与から365日で失効する。Actions variable REAUTH_DEADLINE_<TENANT>
@@ -67,15 +70,18 @@ NODE_TAB = "ノードサイズ"      # ノード商品数キャッシュ用タ�
 NODE_TTL_HOURS = 24            # 商品数の再計測間隔（計測は数十APIコールかかるため日次）
 NODE_TAB_HEADER = ["ノードID", "ノード名", "推定商品数(自動)", "最終計測(自動)"]
 
-META_TAB = "監視メタ"          # 稼働確認/新商品同期の実施日などを保持するタブ（自動作成）
+META_TAB = "監視メタ"          # 新商品同期/再認可リマインドの実施日などを保持するタブ（自動作成）
 META_TAB_HEADER = ["キー", "値", "更新(自動)"]
 
 # SP-API再認可期限リマインドを出す「残日数」の節目（当日以降は毎日）。
 # 期限日は public リポにコミットせず Actions variable REAUTH_DEADLINE_<TENANT> で注入する。
 REAUTH_MILESTONES = {60, 30, 14, 7, 3, 2, 1}
 
-# エラー通知の抑制間隔（継続エラー時の再通知間隔）。状態ファイルは同一Actionsジョブ内
-# (~5.5h)で持続し、ジョブ再起動で消える＝最悪1回だけ余分に通知される（許容）。
+# エラー通知は連続失敗がこの回数に達した時のみ発火（単発の一時失敗で鳴らさない・2026-08-05）。
+# 認可失効(invalid_grant)は自然復旧が無いため回数に関係なく即通知。
+ERR_NOTIFY_MIN_STREAK = 3
+# 通知後の継続エラーの再通知間隔。状態ファイルは同一Actionsジョブ内(~5.5h)で持続し、
+# ジョブ再起動で消える＝継続エラーが跨いだ場合は再カウント(最大3サイクル≒45分の遅延)を許容。
 ERR_NOTIFY_INTERVAL_SEC = 3600
 
 # ステータス定義（severityで通知要否を判定）
@@ -635,19 +641,50 @@ def _err_state_path() -> str:
                         f".errnotify_{_tenant_label()}")
 
 
-def _notify_error(detail: str) -> None:
-    """サイクル失敗をChatworkへ即時通知。継続エラーは ERR_NOTIFY_INTERVAL_SEC 間隔に抑制。"""
-    now = datetime.now(JST)
-    path = _err_state_path()
-    last = 0.0
+def _load_err_state() -> tuple[int, float]:
+    """状態ファイル → (連続失敗回数, 最終通知ts)。
+
+    形式は「回数,最終通知ts」。旧形式（ts単独＝通知済みエラー継続中）は
+    通知済み扱い(回数=ERR_NOTIFY_MIN_STREAK)で引き継ぐ。"""
     try:
-        with open(path, encoding="utf-8") as f:
-            last = float(f.read().strip() or 0)
-    except (OSError, ValueError):
-        pass
-    if now.timestamp() - last < ERR_NOTIFY_INTERVAL_SEC:
+        with open(_err_state_path(), encoding="utf-8") as f:
+            raw = f.read().strip()
+    except OSError:
+        return 0, 0.0
+    try:
+        if "," in raw:
+            cnt, ts = raw.split(",", 1)
+            return int(cnt), float(ts)
+        return ERR_NOTIFY_MIN_STREAK, float(raw or 0)
+    except ValueError:
+        return 0, 0.0
+
+
+def _save_err_state(fails: int, last_notify: float) -> None:
+    try:
+        with open(_err_state_path(), "w", encoding="utf-8") as f:
+            f.write(f"{fails},{last_notify}")
+    except OSError as e:
+        print(f"  [warn] エラー状態ファイル書込失敗: {e}")
+
+
+def _notify_error(detail: str) -> None:
+    """サイクル失敗を記録し、ERR_NOTIFY_MIN_STREAK 回連続した時のみChatworkへ通知。
+
+    単発の一時失敗（API瞬断等）では鳴らさない。認可失効(invalid_grant)は自然復旧が
+    無いため回数に関係なく即通知。通知後の継続エラーは ERR_NOTIFY_INTERVAL_SEC 間隔に抑制。"""
+    now = datetime.now(JST)
+    fails, last_notify = _load_err_state()
+    fails += 1
+    fatal = "invalid_grant" in detail
+    if not fatal and fails < ERR_NOTIFY_MIN_STREAK:
+        _save_err_state(fails, last_notify)
+        print(f"[error] 連続{fails}回目（{ERR_NOTIFY_MIN_STREAK}回連続で通知）: {detail[:200]}")
+        return
+    if now.timestamp() - last_notify < ERR_NOTIFY_INTERVAL_SEC:
+        _save_err_state(fails, last_notify)
         print(f"[error] 通知は{ERR_NOTIFY_INTERVAL_SEC // 60}分間隔に抑制中"
-              f"（前回 {now.timestamp() - last:.0f}秒前）: {detail[:200]}")
+              f"（前回 {now.timestamp() - last_notify:.0f}秒前・連続{fails}回目）: {detail[:200]}")
         return
     if "invalid_grant" in detail:
         # 認可失効はデータ取得の全停止＝最重要。[toall]+🚨で格上げ通知する。
@@ -662,23 +699,33 @@ def _notify_error(detail: str) -> None:
                 "復旧すると✅を通知します。[/info]")
     else:
         body = (f"[info][title]🔴 カート監視エラー（{_tenant_label()}） {now:%Y-%m-%d %H:%M}[/title]\n"
-                f"監視サイクルが失敗し、データ取得/シート更新が止まっています。\n"
+                f"監視サイクルが{fails}回連続で失敗し、データ取得/シート更新が止まっています。\n"
                 f"原因: {detail[:300]}\n"
                 f"[hr]解消まで{ERR_NOTIFY_INTERVAL_SEC // 60}分毎に再通知します。"
                 "復旧すると✅を通知します。[/info]")
     try:
         chatwork_post(body)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(str(now.timestamp()))
-        print(f"[error] Chatworkへエラー通知済み: {detail[:120]}")
+        _save_err_state(fails, now.timestamp())
+        print(f"[error] Chatworkへエラー通知済み（連続{fails}回目）: {detail[:120]}")
     except BaseException as ce:   # 通知経路自体の死(トークン未設定等)もログには必ず残す
+        _save_err_state(fails, last_notify)   # 通知に失敗しても連続回数は必ず記録する
         print(f"[error] エラー通知自体が失敗: {ce} / 元エラー: {detail[:200]}")
 
 
 def _notify_recovery_if_needed() -> None:
-    """直前までエラー通知していた場合のみ、復旧をChatworkへ通知して状態を消す。"""
+    """直前までエラー通知していた場合のみ、復旧をChatworkへ通知して状態を消す。
+
+    通知に至らなかった失敗痕跡（連続3回未満で復旧）は✅を出さず黙って消す
+    （正常時は無通知の方針・2026-08-05）。"""
     path = _err_state_path()
     if not os.path.exists(path):
+        return
+    _, last_notify = _load_err_state()
+    if last_notify <= 0:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
         return
     try:
         chatwork_post(f"[info][title]✅ カート監視 復旧（{_tenant_label()}） "
@@ -818,7 +865,6 @@ def main() -> int:
     writes = []          # 各行の [F状態, G時刻, H相乗りID, Iベストセラー, Jバリ親, Kブラウズ]
     problems = []        # 通知ブロック（ASIN単位）
     n_cart = n_search = n_hijack = n_best = n_var = n_browse = 0
-    n_asin = n_mute = n_unk = n_bad = 0     # 稼働確認通知用の実カウント
     for r in rows:
         r = (r + [""] * 11)[:11]
         asin = r[COL_ASIN].strip()
@@ -826,19 +872,16 @@ def main() -> int:
             writes.append([r[COL_STATUS], r[COL_CHECK], r[COL_SELLERS], r[COL_BEST],
                            r[COL_PARENT], r[COL_BROWSE]])
             continue
-        n_asin += 1
         sku, name = r[COL_SKU].strip(), r[COL_NAME].strip()
         muted = str(r[COL_MUTE]).strip().upper() in ("TRUE", "1", "YES", "✓")
         prev_sellers = {s.strip() for s in str(r[COL_SELLERS]).split(",") if s.strip()}
         prev_best, prev_parent = r[COL_BEST].strip(), r[COL_PARENT].strip()
         prev_browse = r[COL_BROWSE].strip()
         if muted:
-            n_mute += 1
             writes.append([ST_MUTED, now, r[COL_SELLERS], r[COL_BEST], r[COL_PARENT], r[COL_BROWSE]])
             continue
         payload = get_item_offers(token, asin)
         if payload is None:
-            n_unk += 1
             writes.append([r[COL_STATUS] or "判定不可", now, r[COL_SELLERS], r[COL_BEST],
                            r[COL_PARENT], r[COL_BROWSE]])
             time.sleep(0.6)
@@ -943,8 +986,6 @@ def main() -> int:
 
         status_parts = list(issues) + (["相乗りあり"] if others else [])
         status_str = "／".join(status_parts) if status_parts else ST_OK
-        if status_str != ST_OK:
-            n_bad += 1
         writes.append([status_str, now, ",".join(others), best_str, parents_now, browse_str])
 
         new_sellers = [s for s in others if s not in prev_sellers]
@@ -1031,32 +1072,8 @@ def main() -> int:
     else:
         print("[ok] 新規異常なし")
 
-    # 5) 毎朝9時台の稼働確認（日1回・サイクル成功時のみ＝失敗時は _notify_error が担う）。
-    #    プロセス生存でなく「シート書込まで完了した実カウント」で報告する。
-    end_dt = datetime.now(JST)
-    if end_dt.hour >= 9 and meta.get("health_last_date") != end_dt.strftime("%Y-%m-%d"):
-        late = end_dt.hour >= 10   # 9時台に出せなかった（朝の失敗/ジョブ遅延後の遅延発信）
-        title = ("✅ カート監視 正常稼働" if not late
-                 else "✅ カート監視 稼働確認（遅延発信）")
-        note = ("毎朝9時台の稼働確認通知です。"
-                if not late else
-                "本日9時台は稼働確認を出せませんでした（朝のエラー/遅延の可能性）。"
-                "現時点のサイクルは正常です。")
-        body = (f"[info][title]{title}（{_tenant_label()}） "
-                f"{end_dt:%Y-%m-%d %H:%M}[/title]\n"
-                "監視サイクルはエラーなく完了し、管理シートも更新済みです。\n"
-                f"監視対象: {n_asin}件（うちミュート{n_mute}件）\n"
-                f"現在の異常: {n_bad}件"
-                + (f"（別途 判定不可{n_unk}件）" if n_unk else "")
-                + f"\n[hr]{note}"
-                  "朝にこの✅が無い場合は監視停止の可能性があるためご連絡ください。[/info]")
-        try:
-            chatwork_post(body)
-            meta["health_last_date"] = end_dt.strftime("%Y-%m-%d")
-            save_meta(gtok, sheet_id, meta)
-            print("[health] 稼働確認を通知")
-        except Exception as e:
-            print(f"  [warn] 稼働確認通知失敗（次サイクルで再試行）: {e}")
+    # 毎朝9時台の「✅正常稼働」通知は2026-08-05に廃止（正常時は無通知の方針）。
+    # Actionsごと停止した場合の検知は CF Worker cart-monitor-dispatcher のwatchdogが担う。
     return 0
 
 
