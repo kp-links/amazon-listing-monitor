@@ -1,0 +1,95 @@
+name: inventory-snapshot
+
+# Inventory Pulse Phase1 — 在庫スナップショットの日次蓄積（3ブランド）。
+# 在庫管理シートをリードオンリーで読み、SKU×日付の1行を追記専用タブに積む。
+# 在庫の過去値は後から取り直せないため、欠測を出さないことが最優先。
+#
+# 実行時刻: JST 13:10 と 17:10 の2回。
+#   在庫アラート（cron は labo 09:35 / nature 09:30 / qiera 09:40）が推奨事項タブを
+#   更新した後に走らせる必要がある。ただし GitHub Actions の schedule は遅延・間引きが
+#   起きる（tripwire_github_actions_cron_skipped）。実測 2026-08-13 は cron 09:35 に対し
+#   実際の更新が 12:10 JST だった。よって 1本目を 13:10 まで下げて余裕を取る。
+#   2本目は 1本目自体が間引かれた場合の保険。
+#   同日ぶんは inventory_snapshot.py が SKU 単位で差分判定するため二重にならない。
+#
+# 使う秘密情報（既存の在庫アラートと同じもの。新規登録は SNAPSHOT_SHEET_ID のみ）:
+#   - GOOGLE_SA_JSON … 共通SA。読み取り元と蓄積先の両方に編集権限が要る
+#   - SALES_SHEET_ID / _NATURE / _QIERA … 読み取り元＝各ブランドの在庫管理シート
+#   - SNAPSHOT_SHEET_ID … 蓄積先の専用スプレッドシート（未設定なら読み取り元に書く）
+on:
+  schedule:
+    - cron: "10 4 * * *"   # JST 13:10
+    - cron: "10 8 * * *"   # JST 17:10（cron間引き対策の2本目）
+  workflow_dispatch:
+    inputs:
+      brand:
+        description: "対象ブランド（空=3ブランドすべて）"
+        type: choice
+        options: ["", "labo", "nature", "qiera"]
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inventory-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false        # 1ブランド落ちても他は蓄積する（欠測を最小化）
+      max-parallel: 1         # 3ブランドが同じ蓄積先に同時 append するのを避ける
+      # enabled=false のブランドは schedule では走らない（手動実行では brand 指定で走る）。
+      # 悩み解決ラボで数日クリーンに回してから nature/qiera を true にする。
+      # nature/qiera は health_tabs 未設定・format_date_cell 未設定で、
+      # 列マップの実地検証も labo ほど厚くないため段階投入する。
+      matrix:
+        include:
+          - brand: labo
+            sheet_secret: SALES_SHEET_ID
+            enabled: true
+          - brand: nature
+            sheet_secret: SALES_SHEET_ID_NATURE
+            enabled: false
+          - brand: qiera
+            sheet_secret: SALES_SHEET_ID_QIERA
+            enabled: false
+    steps:
+      - name: Decide whether this brand runs
+        id: gate
+        run: |
+          want="${{ inputs.brand }}"
+          if [ -n "$want" ]; then
+            # 手動実行でブランドを名指しした場合は enabled を無視して走らせる
+            [ "$want" = "${{ matrix.brand }}" ] && echo "run=true" >> "$GITHUB_OUTPUT" \
+                                                || echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=${{ matrix.enabled }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+        if: steps.gate.outputs.run == 'true'
+
+      - name: Snapshot inventory (${{ matrix.brand }})
+        if: steps.gate.outputs.run == 'true'
+        env:
+          BRAND: ${{ matrix.brand }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SALES_SHEET_ID: ${{ secrets[matrix.sheet_secret] }}
+          SNAPSHOT_SHEET_ID: ${{ secrets.SNAPSHOT_SHEET_ID }}
+        # SNAPSHOT_SHEET_ID の設定漏れを、読み取り元への書き込みで気づく前に止める。
+        run: |
+          if [ -z "$SNAPSHOT_SHEET_ID" ]; then
+            echo "::error::SNAPSHOT_SHEET_ID が未設定。蓄積先スプレッドシートを作成し、共通SAに編集権限を付けてから登録すること"
+            exit 1
+          fi
+          python inventory_snapshot.py
