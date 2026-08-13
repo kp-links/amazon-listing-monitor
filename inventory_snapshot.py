@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import urllib.parse
@@ -131,9 +132,40 @@ def _status_of(e: Exception) -> int | None:
 
 def _safe_err(e: Exception) -> str:
     """例外を要約する。requests の例外文には URL（＝スプレッドシートID）が載るため、
-    Actions のログに素で出さない（機密情報漏洩防止）。"""
+    Actions のログに素で出さない（機密情報漏洩防止）。
+
+    Google API の error.status（PERMISSION_DENIED / SERVICE_DISABLED 等の列挙値）は
+    切り分けに必須なので載せる。message は ID を含みうるので載せない。
+    """
     st = _status_of(e)
-    return f"{type(e).__name__}" + (f"(HTTP {st})" if st else "")
+    api = ""
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        try:
+            api = (resp.json().get("error") or {}).get("status", "") or ""
+        except Exception:  # noqa: BLE001 — 本文がJSONでない場合は無視
+            api = ""
+    bits = [b for b in (f"HTTP {st}" if st else "", api) if b]
+    return f"{type(e).__name__}" + (f"({', '.join(bits)})" if bits else "")
+
+
+def sa_identity() -> str:
+    """実行中のサービスアカウントのメールアドレス。
+
+    アドレスは秘密ではない識別子。403 の切り分けが「どのSAで動いているか分からない」
+    ために推測になるのを防ぐため、起動時に必ず出す（2026-08-13 に実際に詰まった）。
+    """
+    try:
+        raw = os.getenv("GOOGLE_SA_JSON", "")
+        if raw:
+            return json.loads(raw).get("client_email", "(不明)")
+        path = os.getenv("GOOGLE_CREDENTIALS_PATH", "")
+        if path:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f).get("client_email", "(不明)")
+    except Exception:  # noqa: BLE001 — 診断用途なので失敗しても本処理は続ける
+        pass
+    return "(不明)"
 
 
 def _cell(row: list, idx: int) -> str:
@@ -446,6 +478,8 @@ def main() -> int:
     fetched_at = now.strftime("%Y-%m-%d %H:%M JST")
 
     token = sheets_token()
+    print(f"[info] 実行SA: {sa_identity()}"
+          "（蓄積先シートにこのアドレスを編集者で共有していないと 403 になる）")
     extra = verify_extra_cols(token, src_id, brand)
     fmt = load_format_rows(token, src_id, brand, extra)
     if not fmt:
