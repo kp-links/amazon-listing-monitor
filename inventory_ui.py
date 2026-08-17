@@ -103,20 +103,39 @@ def _apply_sev_rows(sty, sev_col: str):
     return sty.apply(_row, axis=1)
 
 
-def _apply_group_tints(sty, cols):
-    """列グループの薄背景（在庫=薄青/販売=薄緑/日数・bot指標=薄橙）。"""
-    groups = [
-        (["総在庫", "FBA在庫", "ココ在庫", "マイクロアルジェAmazon在庫",
-          "マイクロアルジェ楽天在庫", "自社在庫", "依頼済数量"], _TINT_STOCK),
-        (["シート販売数(総)", "シート販売数(Amazon)", "シート販売数(ココ)"], _TINT_SALES),
-        (["シート在庫日数(総)", "bot総在庫日数", "bot発注点ROP"], _TINT_DAYS),
-    ]
-    for names, tint in groups:
-        subset = [c for c in names if c in cols]
-        if subset:
-            sty = sty.set_properties(subset=subset,
-                                     **{"background-color": tint, "color": _INK})
-    return sty
+# 列ブロック色の明/暗2段（商品グループの偶奇で振る）。左=偶数グループ、右=奇数。
+_BLOCK_SHADES = {}
+for _c in ("総在庫", "FBA在庫", "ココ在庫", "マイクロアルジェAmazon在庫",
+           "マイクロアルジェ楽天在庫", "自社在庫", "依頼済数量"):
+    _BLOCK_SHADES[_c] = (_TINT_STOCK, "#dcebfd")          # 在庫=薄青
+for _c in ("シート販売数(総)", "シート販売数(Amazon)", "シート販売数(ココ)"):
+    _BLOCK_SHADES[_c] = (_TINT_SALES, "#dbeedd")          # 販売=薄緑
+for _c in ("シート在庫日数(総)", "bot総在庫日数", "bot発注点ROP"):
+    _BLOCK_SHADES[_c] = (_TINT_DAYS, "#fbe9cf")           # 日数/bot指標=薄橙
+_BAND_ID = ("#ffffff", "#e8ecf1")                          # 識別子・その他の列
+
+
+def _apply_product_bands(sty, frame: pd.DataFrame):
+    """商品グループごとの行バンド配色。
+
+    同一商品（連続行）は同トーン、次の商品で明/暗を切替え、商品の切れ目に
+    上罫線を引く。列ブロック色（在庫=青/販売=緑/日数=橙）は保ったまま
+    明暗2段で縞にするので、縦のブロック感と横の商品まとまりが両立する。
+    """
+    prod = frame["商品名"].astype(str)
+    grp = (prod != prod.shift()).cumsum()
+    odd = (grp % 2 == 1)
+    first = (prod != prod.shift())
+
+    def _row(row):
+        is_odd = bool(odd.loc[row.name])
+        border = "border-top:2px solid #9aa4b5;" if bool(first.loc[row.name]) else ""
+        css = []
+        for col in row.index:
+            ev, od = _BLOCK_SHADES.get(col, _BAND_ID)
+            css.append(f"{border}background-color:{od if is_odd else ev};color:{_INK}")
+        return css
+    return sty.apply(_row, axis=1)
 
 
 def _apply_days_alert(sty, cols):
@@ -232,14 +251,14 @@ if q.strip():
                 q.strip(), case=False, na=False, regex=False)
     all_rows = all_rows[mask]
 _sty = _style_commas(all_rows)
-_sty = _apply_group_tints(_sty, all_rows.columns)
+_sty = _apply_product_bands(_sty, all_rows)
 _sty = _apply_days_alert(_sty, all_rows.columns)
 if "bot優先度" in all_rows.columns:
     _sty = _cellmap(_sty, lambda v: _bg(_SEV_BG[str(v).strip()])
                     if str(v).strip() in _SEV_BG else "", ["bot優先度"])
 st.dataframe(_sty, use_container_width=True, hide_index=True,
              height=min(700, 60 + 36 * max(1, len(all_rows))))
-st.caption(f"{len(all_rows)} SKU 表示（行順は在庫管理シートと同じ）。"
+st.caption(f"{len(all_rows)} SKU 表示（行順は在庫管理シートと同じ・商品ごとに明暗の縞＋境界線）。"
            "色: 🟦在庫 🟩販売 🟧在庫日数・bot指標 ／ 在庫日数セル 赤=120日未満・橙=180日未満")
 
 # ── ③在庫推移（行=SKU × 列=日付）────────────────────────────────────────────
