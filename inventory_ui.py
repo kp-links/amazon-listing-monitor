@@ -325,17 +325,29 @@ if st.sidebar.button("🔄 最新データに更新"):
     load.clear()
     st.rerun()
 
-st.title("📦 Inventory Pulse")
+# 会社別アプリ分離（2026-08-17 滝谷さん指示）: サードナレッジ/ナチュレ/ディアスリーは
+# 別法人のため、1つのUIにブランドタブで同居させない。UI_BRAND を設定した
+# サービスはそのブランド専用アプリになる（横展開時はサービスを会社ごとに分けて
+# それぞれ別の UI_TOKEN を発行する）。未設定はローカル開発用の全ブランド表示。
+_UI_BRAND = os.environ.get("UI_BRAND", "").strip()
 present = set(df["ブランド"].unique())
-tab_keys = _BRAND_ORDER + sorted(present - set(_BRAND_ORDER))
-tabs = st.tabs([_BRAND_LABEL.get(k, k) for k in tab_keys])
-for tab, bkey in zip(tabs, tab_keys):
-    with tab:
-        if bkey not in present:
-            st.info("このブランドのスナップショット蓄積は未開始です"
-                    "（Cloud Run Job 有効化で自動的に表示されます）")
-            continue
-        _render_brand(df[df["ブランド"] == bkey], bkey)
+if _UI_BRAND:
+    st.title(f"📦 Inventory Pulse — {_BRAND_LABEL.get(_UI_BRAND, _UI_BRAND)}")
+    if _UI_BRAND not in present:
+        st.warning("このブランドのスナップショット蓄積はまだありません")
+        st.stop()
+    _render_brand(df[df["ブランド"] == _UI_BRAND], _UI_BRAND)
+else:
+    st.title("📦 Inventory Pulse（全ブランド・開発用）")
+    tab_keys = _BRAND_ORDER + sorted(present - set(_BRAND_ORDER))
+    tabs = st.tabs([_BRAND_LABEL.get(k, k) for k in tab_keys])
+    for tab, bkey in zip(tabs, tab_keys):
+        with tab:
+            if bkey not in present:
+                st.info("このブランドのスナップショット蓄積は未開始です"
+                        "（Cloud Run Job 有効化で自動的に表示されます）")
+                continue
+            _render_brand(df[df["ブランド"] == bkey], bkey)
 
 
 # ── Phase4a: SKU別 発注LT の手入力（🧩SKUマスタdraft へ書き戻し）─────────────
@@ -422,7 +434,11 @@ def _save_lt(edited: pd.DataFrame, original: pd.DataFrame) -> tuple[int, list[st
 
 st.divider()
 with st.expander("⚙️ SKU別 発注LT設定（🧩SKUマスタdraft を直接編集・翌朝のbotから反映）"):
-    if not _MASTER_SHEET:
+    # 🧩SKUマスタdraft は現状 labo 147SKU の単一タブ（ブランド列なし）。
+    # nature/qiera 横展時はマスタを会社別に分けてから開放する。
+    if _UI_BRAND not in ("", "labo"):
+        st.info("LT編集はこの会社のSKUマスタ整備後に開放します")
+    elif not _MASTER_SHEET:
         st.info("SNAPSHOT_SHEET_ID が未設定のため、LT編集はこの環境では無効です")
     else:
         if st.session_state.get("lt_saved_msg"):
