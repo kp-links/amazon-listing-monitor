@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import brands as brands_mod
-from inventory_alert import resolve_title, sheets_token
+from inventory_alert import METRICS_TAB, resolve_title, sheets_token
 from sales30d import _a1, _sheets_call, sheet_read
 
 JST = timezone(timedelta(hours=9))
@@ -397,26 +397,52 @@ def load_ne_rows(token: str, sheet_id: str, brand) -> dict:
 
 
 def load_bot_alerts(token: str, sheet_id: str, brand) -> dict:
-    """📊在庫アラート(bot) タブを SKU 索引で読む。
+    """bot指標を SKU 索引で読む。
 
-    このタブはフラグの立ったSKUだけを載せる（全SKUではない）ため、
-    大半のSKUで bot 列は空になる。全SKU分の日販・在庫日数を持つのは Phase2 の宿題。
+    まず 📈bot指標(全SKU) タブ（inventory_alert が Phase4 で全SKU分を書く）を読み、
+    未作成・空なら従来の 📊在庫アラート(bot)（フラグSKUのみ）にフォールバックする。
+    どちらも A1=注記 / 2行目=ヘッダ / 3行目〜データ の同型で、項目名で引くため
+    同じパーサで読める。
 
-    タブ未作成（400/404）なら空で続行するが、認証・権限・API障害（401/403/429/5xx）は
-    握りつぶさず落とす。それらを空で通すと「bot列が無い履歴」が恒久的に焼き付くため。
-    タブ名で直接読む（gid 解決を挟まないのは、読み取り元へのアクセスを最小にするため）。
+    タブ未作成（400/404）なら次へ・最終的に空で続行するが、認証・権限・API障害
+    （401/403/429/5xx）は握りつぶさず落とす。それらを空で通すと「bot列が無い履歴」が
+    恒久的に焼き付くため。タブ名で直接読む（gid 解決を挟まないのは、読み取り元への
+    アクセスを最小にするため）。
     """
-    try:
-        rows = sheet_read(token, sheet_id, _a1(brand.rec_tab_title, "A2:AZ"))
-    except Exception as e:  # noqa: BLE001
-        st = _status_of(e)
-        if st in (400, 404):
-            print(f"[warn] 在庫アラートタブが無い（{_safe_err(e)}）。bot 列は空で続行")
-            return {}
-        raise SystemExit(f"[FATAL] 在庫アラートタブの読み取りに失敗: {_safe_err(e)}")
-    if len(rows) < 2:
-        print("[warn] 在庫アラートタブに明細が無い（bot 未実行？）。bot 列は空で続行")
+    def _is_stale(got: list[list], tab: str) -> bool:
+        """更新日時が当日でないタブは不採用。前日のbot値を当日行に焼き込むと
+        履歴が恒久汚染されるため、bot未実行の日は「bot列が空」が真値（Codex P1）。"""
+        head = [str(h).strip() for h in got[0]]
+        if "更新日時" not in head:
+            return False   # 旧形式タブは判定不能→従来どおり採用
+        ts = str(_cell(got[1], head.index("更新日時"))).strip()  # 例 2026/08/17 09:35 JST
+        today = datetime.now(JST).strftime("%Y-%m-%d")
+        if ts[:10].replace("/", "-") == today:
+            return False
+        print(f"[warn] {tab} の更新日時が当日でない（{ts or '空'}）→不採用",
+              file=sys.stderr)
+        return True
+
+    rows, src = [], ""
+    for tab, last in ((METRICS_TAB, False), (brand.rec_tab_title, True)):
+        try:
+            got = sheet_read(token, sheet_id, _a1(tab, "A2:AZ"))
+        except Exception as e:  # noqa: BLE001
+            st = _status_of(e)
+            if st in (400, 404):
+                if last:
+                    print(f"[warn] 在庫アラートタブが無い（{_safe_err(e)}）。bot 列は空で続行")
+                    return {}
+                continue   # 全SKUタブ未作成（alert が旧版）→ 推奨事項タブへ
+            raise SystemExit(f"[FATAL] botタブの読み取りに失敗: {_safe_err(e)}")
+        if len(got) >= 2 and not _is_stale(got, tab):
+            rows, src = got, tab
+            break
+    if not rows:
+        print("[warn] 当日分のbot明細が無い（bot 今日未実行？）。bot 列は空で続行")
         return {}
+    if src == brand.rec_tab_title:
+        print("[info] 📈bot指標(全SKU) が使えない→推奨事項タブ（フラグSKUのみ）で続行")
     header = [str(h).strip() for h in rows[0]]
     if "SKU" not in header:
         print(f"[warn] 在庫アラートタブのヘッダに 'SKU' が無い（列数={len(header)}）",

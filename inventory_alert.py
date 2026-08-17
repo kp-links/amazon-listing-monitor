@@ -444,7 +444,8 @@ def analyze(brand, fmt_rows, ne_map, amz7, amz30, today, use_spapi, master=None)
         m["primary_sev"], m["primary_kind"] = primary["sev"], primary["kind"]
     results.sort(key=lambda r: (SEV_RANK.get(r["primary_sev"], 9),
                                 r["days_total"] if r["days_total"] is not None else 1e9))
-    return {"brand": brand, "today": today, "total_skus": len(fmt_rows), "results": results}
+    return {"brand": brand, "today": today, "total_skus": len(fmt_rows),
+            "results": results, "all_metrics": metrics}
 
 
 def _fulfillment_triggers(m, th):
@@ -711,6 +712,91 @@ def write_recommendation(token: str, sheet_id: str, brand, result, now: datetime
     return gid
 
 
+# ── 全SKU bot指標タブ（Phase4: スプシ脱却用に全SKU分の日販・在庫日数を残す）──
+# 推奨事項タブはフラグSKUのみで、大半のSKUの日販・在庫日数がどこにも記録されない。
+# このタブは毎回全SKUを上書きし、inventory_snapshot が読んで Parquet に焼き込む。
+# ヘッダ名は推奨事項タブと同じ語彙（snapshot 側 BOT_FIELDS が項目名で引くため）。
+METRICS_TAB = "📈bot指標(全SKU)"
+METRICS_HEADERS = [
+    "更新日時", "商品名", "サイズ", "SKU", "ASIN",
+    "優先度", "区分",
+    "A日販7d", "A日販30d", "A加速",
+    "コ日販7d", "コ日販30d", "コ加速",
+    "FBA在庫日数", "ココ在庫日数", "総在庫日数",
+    "在庫切れ予想(総)", "発注点ROP", "推奨アクション",
+]
+
+
+def _metrics_row(m: dict, ts: str) -> list:
+    def fa(v): return "" if v is None else round(v, 1)
+    if m["triggers"]:
+        primary = min(m["triggers"], key=lambda t: SEV_RANK.get(t["sev"], 9))
+        sev = primary["sev"]
+        kind = "／".join(sorted({t["kind"] for t in m["triggers"]}))
+        action = "／".join(t["action"] for t in m["triggers"])
+    else:
+        sev = kind = action = ""
+    return [
+        ts, m["product"], m["size"], m["sku"], m["asin"], sev, kind,
+        fa(m["v7a"]), fa(m["v30a"]),
+        ("" if m["accel_a"] is None else round(m["accel_a"], 2)),
+        fa(m["v7c"]), fa(m["v30c"]),
+        ("" if m["accel_c"] is None else round(m["accel_c"], 2)),
+        ("" if m["days_fba"] is None else round(m["days_fba"])),
+        ("" if m["days_coco"] is None else round(m["days_coco"])),
+        ("" if m["days_total"] is None else round(m["days_total"])),
+        (m["stockout_total"].strftime("%Y/%m/%d") if m["stockout_total"] else ""),
+        ("" if m["rop"] is None else round(m["rop"])),
+        action,
+    ]
+
+
+def write_bot_metrics(token: str, sheet_id: str, result, now: datetime) -> None:
+    """全SKUのbot指標を METRICS_TAB へ全量上書きする（構造は推奨事項タブと同型:
+    A1=bot所有印つき注記 / 2行目=ヘッダ / 3行目〜データ。人手タブ誤上書きガードも同じ）。"""
+    last_col = chr(ord("A") + len(METRICS_HEADERS) - 1)  # 'S'
+    gid = get_or_create_tab(token, sheet_id, METRICS_TAB)
+    ts = now.strftime("%Y/%m/%d %H:%M JST")
+    metrics = result["all_metrics"]
+    note = (f"{MARKER_PREFIX}・編集禁止（毎日全量上書き） ／ 更新 {ts}"
+            f" ／ 全{len(metrics)}SKU")
+
+    # グリッド不足なら先に行を足す（既定1000行。全SKU書込は998行を超えうる。Codex P2）。
+    # rowCount を直接縮小方向に set すると既存行が消えるため appendDimension のみ使う。
+    meta = _sheets_call("GET", token, sheet_id, "",
+                        params={"fields": "sheets.properties"})
+    cap = next((sh["properties"].get("gridProperties", {}).get("rowCount", 0)
+                for sh in meta.get("sheets", [])
+                if sh["properties"].get("sheetId") == gid), 0)
+    need = len(metrics) + 12   # 注記+ヘッダ+余白
+    if cap and cap < need:
+        _sheets_call("POST", token, sheet_id, ":batchUpdate", body={"requests": [{
+            "appendDimension": {"sheetId": gid, "dimension": "ROWS",
+                                "length": need - cap}}]})
+
+    prev = sheet_read(token, sheet_id, _a1(METRICS_TAB, "A1:A"))
+    prev_a1 = (prev[0][0].strip() if prev and prev[0] and prev[0][0] else "")
+    if prev_a1 and not prev_a1.startswith(MARKER_PREFIX):
+        raise RuntimeError(
+            f"bot指標タブ '{METRICS_TAB}' のA1がbot所有印で始まらない（人手タブの可能性）"
+            "→データ破壊を避けるため書込み中止")
+    prev_rows = len(prev)
+
+    block = [[note] + [""] * (len(METRICS_HEADERS) - 1), METRICS_HEADERS]
+    for m in metrics:
+        block.append(_metrics_row(m, ts))
+    sheet_update(token, sheet_id, _a1(METRICS_TAB, f"A1:{last_col}{len(block)}"), block)
+    if prev_rows > len(block):
+        sheet_clear(token, sheet_id,
+                    _a1(METRICS_TAB, f"A{len(block) + 1}:{last_col}{prev_rows}"))
+
+    after = sheet_read(token, sheet_id, _a1(METRICS_TAB, f"A1:{last_col}2"))
+    a1_ok = bool(after) and after[0] and str(after[0][0]).startswith(MARKER_PREFIX)
+    hdr_ok = len(after) >= 2 and (after[1][:1] == ["更新日時"])
+    if not (a1_ok and hdr_ok):
+        raise RuntimeError(f"bot指標タブ検証失敗: A1/ヘッダ不一致 (先頭2行={after[:2]})")
+
+
 # ── Chatwork ───────────────────────────────────────────────────────────────
 def chatwork_post(token: str, room: str, body: str) -> dict:
     r = requests.post(f"https://api.chatwork.com/v2/rooms/{room}/messages",
@@ -816,19 +902,35 @@ def main() -> int:
         ts = now.strftime("%Y/%m/%d %H:%M")
         for r in result["results"][:5]:
             print(_rec_row(r, ts))
+        print(f"\n===== bot指標行（全{len(result['all_metrics'])}SKU中 先頭3件）=====")
+        for m in result["all_metrics"][:3]:
+            print(_metrics_row(m, ts))
         return 0
 
     gid = write_recommendation(gtok, sheet_id, brand, result, now)
     print(f"[ok] 推奨事項シート更新 gid={gid}（{flagged}件）")
+
+    # 全SKU bot指標（Phase4）。失敗してもアラート本体・Chatworkは完遂させるが、
+    # サイレントにはしない（except:pass 禁止）＝非0終了でワークフローを赤にする。
+    # snapshot 側は本タブが無ければ推奨事項タブへフォールバックするため劣化止まり。
+    rc = 0
+    try:
+        write_bot_metrics(gtok, sheet_id, result, now)
+        print(f"[ok] bot指標タブ更新（全{len(result['all_metrics'])}SKU）")
+    except Exception as e:
+        rc = 1
+        print(f"[error] bot指標タブの書込失敗（アラート本体は成功）: "
+              f"{type(e).__name__}: {str(e)[:200]}")
+
     if args.no_chatwork:
         print("[info] --no-chatwork: Chatwork投稿をスキップ")
-        return 0
+        return rc
     if brand.chatwork_mentions == "" and flagged == 0:
         print("[info] 要対応0件・メンション未設定→Chatwork投稿スキップ")
-        return 0
+        return rc
     resp = chatwork_post(_env("CHATWORK_TOKEN"), _env("CHATWORK_ROOM_ID"), body)
     print(f"[ok] Chatwork投稿 message_id={resp.get('message_id')}")
-    return 0
+    return rc
 
 
 if __name__ == "__main__":

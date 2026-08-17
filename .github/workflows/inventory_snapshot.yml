@@ -43,9 +43,8 @@ jobs:
       fail-fast: false        # 1ブランド落ちても他は蓄積する（欠測を最小化）
       max-parallel: 1         # 3ブランドが同じ蓄積先に同時 append するのを避ける
       # enabled=false のブランドは schedule では走らない（手動実行では brand 指定で走る）。
-      # 悩み解決ラボで数日クリーンに回してから nature/qiera を true にする。
-      # nature/qiera は health_tabs 未設定・format_date_cell 未設定で、
-      # 列マップの実地検証も labo ほど厚くないため段階投入する。
+      # labo 2026-08-13〜クリーン稼働4日で条件クリア、nature/qiera は 2026-08-17 に
+      # dry-run（列ズレ警告なし）を確認して有効化した。
       matrix:
         include:
           - brand: labo
@@ -53,10 +52,10 @@ jobs:
             enabled: true
           - brand: nature
             sheet_secret: SALES_SHEET_ID_NATURE
-            enabled: false
+            enabled: true
           - brand: qiera
             sheet_secret: SALES_SHEET_ID_QIERA
-            enabled: false
+            enabled: true
     steps:
       - name: Decide whether this brand runs
         id: gate

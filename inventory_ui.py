@@ -285,8 +285,8 @@ def _render_brand(b: pd.DataFrame, bkey: str) -> None:
                  height=min(700, 60 + 36 * max(1, len(all_rows))))
     st.caption(f"{len(all_rows)} SKU 表示（行順は在庫管理シートと同じ・商品ごとに明暗の縞＋境界線）。"
                "色: 🟦在庫 🟩販売 🟧在庫日数・bot指標 ／ 警告色: 総在庫日数 赤<120日・橙<180日、"
-               "FBA/ココ在庫日数 赤<30日・橙<45日 ／ bot列はフラグSKUのみ値あり"
-               "（全SKUのbot指標記録は次フェーズ）")
+               "FBA/ココ在庫日数 赤<30日・橙<45日 ／ bot列は 2026-08-18 以降の"
+               "スナップショットから全SKUに値が入ります（それ以前はフラグSKUのみ）")
 
     # ③在庫推移（行=SKU × 列=日付）
     st.subheader("③ 在庫推移（列=日付・新しい日付が右）")
@@ -336,3 +336,131 @@ for tab, bkey in zip(tabs, tab_keys):
                     "（Cloud Run Job 有効化で自動的に表示されます）")
             continue
         _render_brand(df[df["ブランド"] == bkey], bkey)
+
+
+# ── Phase4a: SKU別 発注LT の手入力（🧩SKUマスタdraft へ書き戻し）─────────────
+# 本画面で唯一の書き込み経路。対象は LT(日) 列（G列）1列のみ。
+# 書き込みは fail-closed（例外は画面に出して止める・握りつぶさない）。
+# 手順は load → 楽観ロック（SKU列再読で行ズレ検知）→ 変更セルのみ update → 読み戻し verify。
+# 変更前後の値は stdout（Cloud Run ログ）に残す＝復元用の記録。
+_MASTER_SHEET = os.environ.get("SNAPSHOT_SHEET_ID", "")
+_MASTER_TAB = "🧩SKUマスタdraft"
+_MASTER_START_ROW = 4          # データ開始行（inventory_alert.load_sku_master と同じ）
+_LT_COL_LETTER = "G"           # LT(日)
+_LT_MIN, _LT_MAX = 30, 365
+
+
+@st.cache_data(ttl=60)
+def _load_master() -> pd.DataFrame:
+    from sales30d import _a1, sheet_read
+    from inventory_snapshot import _token
+    rows = sheet_read(_token(), _MASTER_SHEET, _a1(_MASTER_TAB, "A4:K"))
+    recs = []
+    for i, r in enumerate(rows):
+        def cell(idx):
+            return str(r[idx]).strip() if idx < len(r) else ""
+        if not cell(3):
+            continue
+        lt = pd.to_numeric(cell(6), errors="coerce")
+        recs.append({"行": _MASTER_START_ROW + i, "商品名": cell(0), "サイズ": cell(1),
+                     "SKU": cell(3), "発注先": cell(4),
+                     "LT(日)": None if pd.isna(lt) else int(lt), "LT根拠": cell(10)})
+    return pd.DataFrame(recs)
+
+
+def _save_lt(edited: pd.DataFrame, original: pd.DataFrame) -> tuple[int, list[str]]:
+    """変更された LT(日) セルだけを書き戻す。(保存件数, エラーリスト) を返す。"""
+    from sales30d import _a1, _sheets_call, sheet_read
+    from inventory_snapshot import _token
+
+    changes = []   # (行番号, SKU, 旧値, 新値)
+    for idx in original.index:
+        old_v, new_v = original.at[idx, "LT(日)"], edited.at[idx, "LT(日)"]
+        old_n = None if pd.isna(old_v) else int(old_v)
+        new_n = None if pd.isna(new_v) else int(new_v)
+        if old_n == new_n:
+            continue
+        if new_n is not None and not (_LT_MIN <= new_n <= _LT_MAX):
+            return 0, [f"{original.at[idx, 'SKU']}: LT {new_n} は範囲外"
+                       f"（{_LT_MIN}〜{_LT_MAX}日。空欄=既定LTに戻す）"]
+        changes.append((int(original.at[idx, "行"]), str(original.at[idx, "SKU"]),
+                        old_n, new_n))
+    if not changes:
+        return 0, []
+
+    token = _token()
+    # 楽観ロック: SKU列（D列）を再読し、書込先の行に想定どおりのSKUがいるか確認。
+    # タブ側で行の挿入/削除/並べ替えがあった場合に、隣のSKUのLTを壊すのを防ぐ。
+    cur = sheet_read(token, _MASTER_SHEET, _a1(_MASTER_TAB, "D1:D"))
+    for rownum, sku, _, _ in changes:
+        got = (str(cur[rownum - 1][0]).strip()
+               if rownum - 1 < len(cur) and cur[rownum - 1] else "")
+        if got != sku:
+            return 0, [f"行{rownum} のSKUが '{sku}' でなく '{got}'。"
+                       "マスタタブ側で行が動いた可能性→画面を再読込してやり直してください"]
+
+    data = [{"range": _a1(_MASTER_TAB, f"{_LT_COL_LETTER}{rownum}"),
+             "values": [["" if new_n is None else new_n]]}
+            for rownum, _, _, new_n in changes]
+    res = _sheets_call("POST", token, _MASTER_SHEET, "/values:batchUpdate",
+                       body={"valueInputOption": "RAW", "data": data})
+    if res.get("totalUpdatedCells") != len(changes):
+        raise RuntimeError(f"更新セル数が不一致（期待{len(changes)}/"
+                           f"実際{res.get('totalUpdatedCells')}）。タブを直接確認してください")
+
+    # 読み戻し verify ＋ 変更ログ（Cloud Run ログに復元用の旧値を残す）
+    for rownum, sku, old_n, new_n in changes:
+        back = sheet_read(token, _MASTER_SHEET,
+                          _a1(_MASTER_TAB, f"{_LT_COL_LETTER}{rownum}"))
+        got = str(back[0][0]).strip() if back and back[0] else ""
+        want = "" if new_n is None else str(new_n)
+        if got != want:
+            raise RuntimeError(f"verify失敗: 行{rownum} {sku} のLTが '{got}'（期待 '{want}'）")
+        print(f"[lt-edit] 行{rownum} {sku}: {old_n} → {new_n}")
+    return len(changes), []
+
+
+st.divider()
+with st.expander("⚙️ SKU別 発注LT設定（🧩SKUマスタdraft を直接編集・翌朝のbotから反映）"):
+    if not _MASTER_SHEET:
+        st.info("SNAPSHOT_SHEET_ID が未設定のため、LT編集はこの環境では無効です")
+    else:
+        if st.session_state.get("lt_saved_msg"):
+            st.success(st.session_state.pop("lt_saved_msg"))
+        try:
+            master_df = _load_master()
+        except Exception as e:  # noqa: BLE001 — fail-closed: 読めないなら編集させない
+            st.error(f"SKUマスタの読み込みに失敗: {type(e).__name__}: {e}")
+            st.stop()
+        st.caption(f"{len(master_df)} SKU ／ 編集できるのは **LT(日)** 列のみ"
+                   f"（{_LT_MIN}〜{_LT_MAX}日・空欄=既定LT 135日）。"
+                   "保存すると翌朝の在庫アラートbotから新LTで判定されます。"
+                   "LT(ヶ月)・LT根拠列は書き換えません（根拠の正本はマスタタブ側）。")
+        # 保存成功のたびに key を回し、data_editor の編集差分を確実にリセットする
+        _rev = st.session_state.get("lt_rev", 0)
+        edited_df = st.data_editor(
+            master_df, hide_index=True, key=f"lt_editor_{_rev}", num_rows="fixed",
+            disabled=[c for c in master_df.columns if c != "LT(日)"],
+            column_config={
+                "行": None,   # シート行番号は内部管理用（非表示）
+                "LT(日)": st.column_config.NumberColumn(
+                    min_value=_LT_MIN, max_value=_LT_MAX, step=1, format="%d"),
+            },
+            height=min(560, 60 + 36 * max(1, len(master_df))))
+        if st.button("💾 変更したLTを保存", key="lt_save"):
+            try:
+                n, errs = _save_lt(edited_df, master_df)
+            except Exception as e:  # noqa: BLE001 — 部分書込の可能性も画面に明示する
+                st.error(f"保存に失敗（部分的に書き込まれた可能性あり。"
+                         f"マスタタブを直接確認してください）: {type(e).__name__}: {e}")
+                st.stop()
+            if errs:
+                st.error("保存を中止しました: " + " ／ ".join(errs))
+            elif n == 0:
+                st.info("変更はありません")
+            else:
+                # rerun で画面が消えるため、成功メッセージは次回描画で出す
+                st.session_state["lt_saved_msg"] = f"{n} 件のLTを保存しました（翌朝のbotから反映）"
+                _load_master.clear()
+                st.session_state["lt_rev"] = _rev + 1
+                st.rerun()
