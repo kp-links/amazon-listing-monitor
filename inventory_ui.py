@@ -2,7 +2,8 @@
 """Inventory Pulse — 最小UI（Phase3 先行版）。
 
 GCS FUSE 上の在庫スナップショット Parquet を読み、
-①今日の在庫アラート ②在庫推移（行=SKU × 列=日付、時間軸は横）を表示する。
+①今日の在庫アラート ②全SKU一覧（シート同順・カンマ区切り）
+③在庫推移（行=SKU × 列=日付、時間軸は横）を表示する。
 
 設計方針:
   * 判断材料ファースト（policy_analysis_first_decision_tools）
@@ -39,6 +40,31 @@ if st.query_params.get("token", "") != _TOKEN:
 
 _ROOT = Path(os.environ.get("SNAPSHOT_DATA_ROOT", "data")) / "inventory_snapshot"
 _SEV = {"🚨": 0, "🔴": 1, "🟡": 2, "🔺": 3, "🔻": 4}   # inventory_format と同順
+
+
+# 識別子列はカンマ整形の対象外（JAN型の数字SKU等にカンマが付くと識別子が壊れる）
+_ID_COLS = {"SKU", "ASIN", "商品名", "サイズ", "日付"}
+
+
+def _style_commas(frame: pd.DataFrame):
+    """数値列をカンマ区切り（小数切捨て表示）で整形した Styler を返す。
+
+    値そのものは変えない（表示のみ）。文字列で数値が入っている列（parquetの
+    空欄""混在で object になった列）は to_numeric で寄せてから判定する。
+    """
+    out = frame.copy()
+    fmt = {}
+    for col in out.columns:
+        if col in _ID_COLS:
+            continue
+        if out[col].dtype == object:
+            conv = pd.to_numeric(out[col], errors="coerce")
+            # 過半が数値なら数値列とみなす（SKU等の文字列列を巻き込まない）
+            if conv.notna().sum() >= max(1, int(out[col].notna().sum() * 0.5)):
+                out[col] = conv
+        if pd.api.types.is_numeric_dtype(out[col]):
+            fmt[col] = "{:,.0f}"
+    return out.style.format(fmt, na_rep="")
 
 
 @st.cache_data(ttl=600)
@@ -86,13 +112,35 @@ if alerts.empty:
     st.success("フラグの立っているSKUはありません")
 else:
     st.dataframe(
-        alerts[["bot優先度", "bot区分", "商品名", "サイズ", "FBA在庫", "ココ在庫",
-                "総在庫", "botFBA在庫日数", "bot総在庫日数", "bot在庫切れ予想(総)",
-                "bot推奨アクション"]],
+        _style_commas(alerts[["bot優先度", "bot区分", "商品名", "サイズ", "FBA在庫",
+                              "ココ在庫", "総在庫", "botFBA在庫日数", "bot総在庫日数",
+                              "bot在庫切れ予想(総)", "bot推奨アクション"]]),
         use_container_width=True, hide_index=True, height=min(420, 60 + 36 * len(alerts)))
 
-# ── ②在庫推移（行=SKU × 列=日付）────────────────────────────────────────────
-st.subheader("② 在庫推移（列=日付・新しい日付が右）")
+# ── ②全SKU一覧（今日・シートと同じ並び）──────────────────────────────────────
+st.subheader("② 全SKU一覧（最新スナップショット・シートと同順）")
+_ALL_COLS = ["商品名", "サイズ", "ASIN", "SKU",
+             "総在庫", "FBA在庫", "ココ在庫",
+             "マイクロアルジェAmazon在庫", "マイクロアルジェ楽天在庫",
+             "自社在庫", "依頼済数量",
+             "シート販売数(総)", "シート販売数(Amazon)", "シート販売数(ココ)",
+             "シート在庫日数(総)", "bot総在庫日数", "bot発注点ROP",
+             "bot優先度", "bot推奨アクション"]
+all_rows = today[[c for c in _ALL_COLS if c in today.columns]]
+q = st.text_input("絞り込み（商品名/サイズ/SKU/ASIN 部分一致）", "")
+if q.strip():
+    mask = pd.Series(False, index=all_rows.index)
+    for c in ("商品名", "サイズ", "SKU", "ASIN"):
+        if c in all_rows.columns:
+            mask |= all_rows[c].astype(str).str.contains(
+                q.strip(), case=False, na=False, regex=False)
+    all_rows = all_rows[mask]
+st.dataframe(_style_commas(all_rows), use_container_width=True, hide_index=True,
+             height=min(700, 60 + 36 * max(1, len(all_rows))))
+st.caption(f"{len(all_rows)} SKU 表示（行順は在庫管理シートと同じ）")
+
+# ── ③在庫推移（行=SKU × 列=日付）────────────────────────────────────────────
+st.subheader("③ 在庫推移（列=日付・新しい日付が右）")
 metric = st.selectbox(
     "指標", ["FBA在庫", "総在庫", "ココ在庫", "シート在庫日数(総)", "シート在庫日数(Amazon)",
              "シート販売数(Amazon)", "botFBA在庫日数"], index=0)
@@ -104,6 +152,7 @@ if len(pv.columns) >= 2:
     pv["Δ期間"] = pv[last] - pv[first]
 pv = pv.sort_values(pv.columns[-2] if "Δ期間" in pv.columns else pv.columns[-1],
                     na_position="last")
-st.dataframe(pv, use_container_width=True, height=560)
+st.dataframe(_style_commas(pv.reset_index()), use_container_width=True,
+             hide_index=True, height=560)
 st.caption("並び順は最新値の昇順（少ない・危ないものが上）。Δ期間 = 最新 − 蓄積初日。"
            "蓄積が貯まるほど推移の解像度が上がります。")
