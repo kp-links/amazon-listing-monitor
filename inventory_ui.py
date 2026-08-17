@@ -214,51 +214,10 @@ def load() -> pd.DataFrame:
     return pd.concat([pd.read_parquet(p) for p in files], ignore_index=True)
 
 
-df = load()
-if df.empty:
-    st.warning(f"スナップショットがまだ無い（{_ROOT}）")
-    st.stop()
+# ブランドタブ（担当が自ブランドだけを見られるよう完全分離）
+_BRAND_ORDER = ["labo", "nature", "qiera"]
+_BRAND_LABEL = {"labo": "💊 悩み解決ラボ", "nature": "🧴 ナチュレ（LUBEE）", "qiera": "✨ Qiera"}
 
-# 日付は書き込み側（inventory_snapshot.py）が常に %Y-%m-%d で出すため辞書順=時系列。
-if st.sidebar.button("🔄 最新データに更新"):
-    load.clear()
-    st.rerun()
-brands = sorted(df["ブランド"].unique())
-brand = st.sidebar.selectbox("ブランド", brands, index=0)
-b = df[df["ブランド"] == brand]
-dates = sorted(b["日付"].unique())
-latest = dates[-1]
-today = b[b["日付"] == latest]
-
-# ── ヘッダ＋判断サマリ ──────────────────────────────────────────────────────
-st.title("📦 Inventory Pulse")
-st.caption(f"最新スナップショット: {latest} ／ 蓄積 {len(dates)}日分 ／ {len(today)} SKU"
-           "（正本は在庫管理シート。本画面は読み取り専用）")
-
-alerts = today[today["bot優先度"].astype(str).str.strip() != ""].copy()
-if not alerts.empty:
-    alerts["_sev"] = alerts["bot優先度"].map(_SEV).fillna(9)
-    alerts = alerts.sort_values(["_sev", "商品名"])
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("🚨/🔴 発注・至急", int((alerts["_sev"] <= 1).sum()) if not alerts.empty else 0)
-c2.metric("🟡 納品補充", int((alerts["_sev"] == 2).sum()) if not alerts.empty else 0)
-c3.metric("🔺 加速注意", int((alerts["_sev"] == 3).sum()) if not alerts.empty else 0)
-c4.metric("🔻 過剰在庫", int((alerts["_sev"] == 4).sum()) if not alerts.empty else 0)
-
-# ── ①今日の在庫アラート ─────────────────────────────────────────────────────
-st.subheader("① 今日の在庫アラート（bot算出・優先度順）")
-if alerts.empty:
-    st.success("フラグの立っているSKUはありません")
-else:
-    _acols = ["bot優先度", "bot区分", "商品名", "サイズ", "FBA在庫", "ココ在庫",
-              "総在庫", "botFBA在庫日数", "シート在庫日数(ココ)", "bot総在庫日数",
-              "bot在庫切れ予想(総)", "bot推奨アクション"]
-    st.dataframe(
-        _apply_sev_rows(_style_commas(alerts[_acols]), "bot優先度"),
-        use_container_width=True, hide_index=True, height=min(420, 60 + 36 * len(alerts)))
-
-# ── ②全SKU一覧（今日・シートと同じ並び）──────────────────────────────────────
-st.subheader("② 全SKU一覧（最新スナップショット・シートと同順）")
 _ALL_COLS = ["商品名", "サイズ", "ASIN", "SKU",
              "総在庫", "FBA在庫", "ココ在庫",
              "マイクロアルジェAmazon在庫", "マイクロアルジェ楽天在庫",
@@ -270,50 +229,110 @@ _ALL_COLS = ["商品名", "サイズ", "ASIN", "SKU",
              "発注アラート", "FBA納品アラート", "ココ納品アラート", "対応済",
              "現ロット", "発注済ロット",
              "bot優先度", "bot推奨アクション"]
-all_rows = today[[c for c in _ALL_COLS if c in today.columns]]
-q = st.text_input("絞り込み（商品名/サイズ/SKU/ASIN 部分一致）", "")
-if q.strip():
-    mask = pd.Series(False, index=all_rows.index)
-    for c in ("商品名", "サイズ", "SKU", "ASIN"):
-        if c in all_rows.columns:
-            mask |= all_rows[c].astype(str).str.contains(
-                q.strip(), case=False, na=False, regex=False)
-    all_rows = all_rows[mask]
-_sty = _style_commas(all_rows)
-_sty = _apply_product_bands(_sty, all_rows)
-_sty = _apply_days_alert(_sty, all_rows.columns)
-if "bot優先度" in all_rows.columns:
-    _sty = _cellmap(_sty, lambda v: _bg(_SEV_BG[str(v).strip()])
-                    if str(v).strip() in _SEV_BG else "", ["bot優先度"])
-st.dataframe(_sty, use_container_width=True, hide_index=True,
-             column_config=_pin_cols(["商品名", "サイズ"]),
-             height=min(700, 60 + 36 * max(1, len(all_rows))))
-st.caption(f"{len(all_rows)} SKU 表示（行順は在庫管理シートと同じ・商品ごとに明暗の縞＋境界線）。"
-           "色: 🟦在庫 🟩販売 🟧在庫日数・bot指標 ／ 警告色: 総在庫日数 赤<120日・橙<180日、"
-           "FBA/ココ在庫日数 赤<30日・橙<45日 ／ bot列はフラグSKUのみ値あり"
-           "（全SKUのbot指標記録は次フェーズ）")
 
-# ── ③在庫推移（行=SKU × 列=日付）────────────────────────────────────────────
-st.subheader("③ 在庫推移（列=日付・新しい日付が右）")
-metric = st.selectbox(
-    "指標", ["FBA在庫", "総在庫", "ココ在庫", "シート在庫日数(総)", "シート在庫日数(Amazon)",
-             "シート販売数(Amazon)", "botFBA在庫日数"], index=0)
-pv = b.pivot_table(index=["商品名", "サイズ"], columns="日付",
-                   values=metric, aggfunc="first")
-pv = pv[sorted(pv.columns)]
-if len(pv.columns) >= 2:
-    first, last = pv.columns[0], pv.columns[-1]
-    pv["Δ期間"] = pv[last] - pv[first]
-pv = pv.sort_values(pv.columns[-2] if "Δ期間" in pv.columns else pv.columns[-1],
-                    na_position="last")
-pv_flat = pv.reset_index()
-date_cols = [c for c in pv_flat.columns if c not in ("商品名", "サイズ", "Δ期間")]
-_psty = _style_commas(pv_flat)
-_psty = _apply_heat(_psty, pv_flat, date_cols)
-if "Δ期間" in pv_flat.columns:
-    _psty = _apply_delta(_psty, "Δ期間")
-st.dataframe(_psty, use_container_width=True, hide_index=True,
-             column_config=_pin_cols(["商品名", "サイズ"]), height=560)
-st.caption("並び順は最新値の昇順（少ない・危ないものが上）。Δ期間 = 最新 − 蓄積初日"
-           "（薄赤=減少・薄緑=増加）。濃淡=値の大小（表全体で正規化）。"
-           "蓄積が貯まるほど推移の解像度が上がります。")
+
+def _render_brand(b: pd.DataFrame, bkey: str) -> None:
+    """1ブランド分の画面（サマリ→①アラート→②全SKU→③推移）。widget keyはブランド別。"""
+    dates = sorted(b["日付"].unique())
+    latest = dates[-1]
+    today = b[b["日付"] == latest]
+    st.caption(f"最新スナップショット: {latest} ／ 蓄積 {len(dates)}日分 ／ {len(today)} SKU"
+               "（正本は在庫管理シート。本画面は読み取り専用）")
+
+    alerts = today[today["bot優先度"].astype(str).str.strip() != ""].copy()
+    if not alerts.empty:
+        alerts["_sev"] = alerts["bot優先度"].map(_SEV).fillna(9)
+        alerts = alerts.sort_values(["_sev", "商品名"])
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("🚨/🔴 発注・至急", int((alerts["_sev"] <= 1).sum()) if not alerts.empty else 0)
+    c2.metric("🟡 納品補充", int((alerts["_sev"] == 2).sum()) if not alerts.empty else 0)
+    c3.metric("🔺 加速注意", int((alerts["_sev"] == 3).sum()) if not alerts.empty else 0)
+    c4.metric("🔻 過剰在庫", int((alerts["_sev"] == 4).sum()) if not alerts.empty else 0)
+
+    # ①今日の在庫アラート
+    st.subheader("① 今日の在庫アラート（bot算出・優先度順）")
+    if alerts.empty:
+        st.success("フラグの立っているSKUはありません")
+    else:
+        _acols = ["bot優先度", "bot区分", "商品名", "サイズ", "FBA在庫", "ココ在庫",
+                  "総在庫", "botFBA在庫日数", "シート在庫日数(ココ)", "bot総在庫日数",
+                  "bot在庫切れ予想(総)", "bot推奨アクション"]
+        st.dataframe(
+            _apply_sev_rows(_style_commas(alerts[_acols]), "bot優先度"),
+            use_container_width=True, hide_index=True,
+            height=min(420, 60 + 36 * len(alerts)))
+
+    # ②全SKU一覧（今日・シートと同じ並び）
+    st.subheader("② 全SKU一覧（最新スナップショット・シートと同順）")
+    all_rows = today[[c for c in _ALL_COLS if c in today.columns]]
+    q = st.text_input("絞り込み（商品名/サイズ/SKU/ASIN 部分一致）", "",
+                      key=f"q_{bkey}")
+    if q.strip():
+        mask = pd.Series(False, index=all_rows.index)
+        for c in ("商品名", "サイズ", "SKU", "ASIN"):
+            if c in all_rows.columns:
+                mask |= all_rows[c].astype(str).str.contains(
+                    q.strip(), case=False, na=False, regex=False)
+        all_rows = all_rows[mask]
+    sty = _style_commas(all_rows)
+    sty = _apply_product_bands(sty, all_rows)
+    sty = _apply_days_alert(sty, all_rows.columns)
+    if "bot優先度" in all_rows.columns:
+        sty = _cellmap(sty, lambda v: _bg(_SEV_BG[str(v).strip()])
+                       if str(v).strip() in _SEV_BG else "", ["bot優先度"])
+    st.dataframe(sty, use_container_width=True, hide_index=True,
+                 column_config=_pin_cols(["商品名", "サイズ"]),
+                 height=min(700, 60 + 36 * max(1, len(all_rows))))
+    st.caption(f"{len(all_rows)} SKU 表示（行順は在庫管理シートと同じ・商品ごとに明暗の縞＋境界線）。"
+               "色: 🟦在庫 🟩販売 🟧在庫日数・bot指標 ／ 警告色: 総在庫日数 赤<120日・橙<180日、"
+               "FBA/ココ在庫日数 赤<30日・橙<45日 ／ bot列はフラグSKUのみ値あり"
+               "（全SKUのbot指標記録は次フェーズ）")
+
+    # ③在庫推移（行=SKU × 列=日付）
+    st.subheader("③ 在庫推移（列=日付・新しい日付が右）")
+    metric = st.selectbox(
+        "指標", ["FBA在庫", "総在庫", "ココ在庫", "シート在庫日数(総)",
+                 "シート在庫日数(Amazon)", "シート販売数(Amazon)", "botFBA在庫日数"],
+        index=0, key=f"metric_{bkey}")
+    pv = b.pivot_table(index=["商品名", "サイズ"], columns="日付",
+                       values=metric, aggfunc="first")
+    pv = pv[sorted(pv.columns)]
+    if len(pv.columns) >= 2:
+        first, last = pv.columns[0], pv.columns[-1]
+        pv["Δ期間"] = pv[last] - pv[first]
+    pv = pv.sort_values(pv.columns[-2] if "Δ期間" in pv.columns else pv.columns[-1],
+                        na_position="last")
+    pv_flat = pv.reset_index()
+    date_cols = [c for c in pv_flat.columns if c not in ("商品名", "サイズ", "Δ期間")]
+    psty = _style_commas(pv_flat)
+    psty = _apply_heat(psty, pv_flat, date_cols)
+    if "Δ期間" in pv_flat.columns:
+        psty = _apply_delta(psty, "Δ期間")
+    st.dataframe(psty, use_container_width=True, hide_index=True,
+                 column_config=_pin_cols(["商品名", "サイズ"]), height=560)
+    st.caption("並び順は最新値の昇順（少ない・危ないものが上）。Δ期間 = 最新 − 蓄積初日"
+               "（薄赤=減少・薄緑=増加）。濃淡=値の大小（表全体で正規化）。"
+               "蓄積が貯まるほど推移の解像度が上がります。")
+
+
+df = load()
+if df.empty:
+    st.warning(f"スナップショットがまだ無い（{_ROOT}）")
+    st.stop()
+
+# 日付は書き込み側（inventory_snapshot.py）が常に %Y-%m-%d で出すため辞書順=時系列。
+if st.sidebar.button("🔄 最新データに更新"):
+    load.clear()
+    st.rerun()
+
+st.title("📦 Inventory Pulse")
+present = set(df["ブランド"].unique())
+tab_keys = _BRAND_ORDER + sorted(present - set(_BRAND_ORDER))
+tabs = st.tabs([_BRAND_LABEL.get(k, k) for k in tab_keys])
+for tab, bkey in zip(tabs, tab_keys):
+    with tab:
+        if bkey not in present:
+            st.info("このブランドのスナップショット蓄積は未開始です"
+                    "（Cloud Run Job 有効化で自動的に表示されます）")
+            continue
+        _render_brand(df[df["ブランド"] == bkey], bkey)
