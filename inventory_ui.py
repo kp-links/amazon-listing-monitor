@@ -74,6 +74,14 @@ def _bg(color: str, extra: str = "") -> str:
     return f"background-color:{color};color:{_INK}" + (f";{extra}" if extra else "")
 
 
+def _pin_cols(cols) -> dict:
+    """指定列を左に固定する column_config（pinned 未対応の旧streamlitでは無効化）。"""
+    try:
+        return {c: st.column_config.Column(pinned=True) for c in cols}
+    except TypeError:
+        return {}
+
+
 def _style_commas(frame: pd.DataFrame):
     """数値列をカンマ区切り（小数切捨て表示）で整形した Styler を返す。
 
@@ -257,6 +265,7 @@ if "bot優先度" in all_rows.columns:
     _sty = _cellmap(_sty, lambda v: _bg(_SEV_BG[str(v).strip()])
                     if str(v).strip() in _SEV_BG else "", ["bot優先度"])
 st.dataframe(_sty, use_container_width=True, hide_index=True,
+             column_config=_pin_cols(["商品名", "サイズ"]),
              height=min(700, 60 + 36 * max(1, len(all_rows))))
 st.caption(f"{len(all_rows)} SKU 表示（行順は在庫管理シートと同じ・商品ごとに明暗の縞＋境界線）。"
            "色: 🟦在庫 🟩販売 🟧在庫日数・bot指標 ／ 在庫日数セル 赤=120日未満・橙=180日未満")
@@ -280,7 +289,8 @@ _psty = _style_commas(pv_flat)
 _psty = _apply_heat(_psty, pv_flat, date_cols)
 if "Δ期間" in pv_flat.columns:
     _psty = _apply_delta(_psty, "Δ期間")
-st.dataframe(_psty, use_container_width=True, hide_index=True, height=560)
+st.dataframe(_psty, use_container_width=True, hide_index=True,
+             column_config=_pin_cols(["商品名", "サイズ"]), height=560)
 st.caption("並び順は最新値の昇順（少ない・危ないものが上）。Δ期間 = 最新 − 蓄積初日"
            "（薄赤=減少・薄緑=増加）。濃淡=値の大小（表全体で正規化）。"
            "蓄積が貯まるほど推移の解像度が上がります。")
