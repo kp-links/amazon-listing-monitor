@@ -116,9 +116,13 @@ _BLOCK_SHADES = {}
 for _c in ("総在庫", "FBA在庫", "ココ在庫", "マイクロアルジェAmazon在庫",
            "マイクロアルジェ楽天在庫", "自社在庫", "依頼済数量"):
     _BLOCK_SHADES[_c] = (_TINT_STOCK, "#dcebfd")          # 在庫=薄青
-for _c in ("シート販売数(総)", "シート販売数(Amazon)", "シート販売数(ココ)"):
+for _c in ("シート販売数(総)", "シート販売数(Amazon)", "シート販売数(ココ)",
+           "NEココ30d", "botA日販30d", "botコ日販30d"):
     _BLOCK_SHADES[_c] = (_TINT_SALES, "#dbeedd")          # 販売=薄緑
-for _c in ("シート在庫日数(総)", "bot総在庫日数", "bot発注点ROP"):
+for _c in ("シート在庫日数(総)", "シート在庫日数(Amazon)", "シート在庫日数(ココ)",
+           "botFBA在庫日数", "bot総在庫日数", "bot発注点ROP",
+           "シート在庫切れ(総)", "シート在庫切れ(Amazon)", "シート在庫切れ(ココ)",
+           "bot在庫切れ予想(総)"):
     _BLOCK_SHADES[_c] = (_TINT_DAYS, "#fbe9cf")           # 日数/bot指標=薄橙
 _BAND_ID = ("#ffffff", "#e8ecf1")                          # 識別子・その他の列
 
@@ -146,18 +150,31 @@ def _apply_product_bands(sty, frame: pd.DataFrame):
     return sty.apply(_row, axis=1)
 
 
+# 在庫日数の警告閾値（列ごと）。総在庫=発注判定の既定（緊急120/警告180）、
+# FBA/ココ=納品判定の既定（bot fba_low=30日、45日=納品在庫基準）に合わせる。
+_DAYS_THRESH = {
+    "シート在庫日数(総)": (120, 180), "bot総在庫日数": (120, 180),
+    "シート在庫日数(Amazon)": (30, 45), "botFBA在庫日数": (30, 45),
+    "シート在庫日数(ココ)": (30, 45),
+}
+
+
 def _apply_days_alert(sty, cols):
-    """在庫日数セルの警告色（<120日=赤/<180日=橙。閾値は発注sevと同じ既定値）。"""
-    def _cell(v):
-        if not _isnum(v):
+    """在庫日数セルの警告色（列別閾値: 赤=緊急未満/橙=警告未満）。"""
+    for col, (urgent, warn) in _DAYS_THRESH.items():
+        if col not in cols:
+            continue
+
+        def _cell(v, _u=urgent, _w=warn):
+            if not _isnum(v):
+                return ""
+            if v < _u:
+                return _bg(_DAYS_URGENT, "font-weight:600")
+            if v < _w:
+                return _bg(_DAYS_WARN)
             return ""
-        if v < 120:
-            return _bg(_DAYS_URGENT, "font-weight:600")
-        if v < 180:
-            return _bg(_DAYS_WARN)
-        return ""
-    subset = [c for c in ("シート在庫日数(総)", "bot総在庫日数") if c in cols]
-    return _cellmap(sty, _cell, subset) if subset else sty
+        sty = _cellmap(sty, _cell, [col])
+    return sty
 
 
 def _apply_heat(sty, frame: pd.DataFrame, cols):
@@ -234,8 +251,8 @@ if alerts.empty:
     st.success("フラグの立っているSKUはありません")
 else:
     _acols = ["bot優先度", "bot区分", "商品名", "サイズ", "FBA在庫", "ココ在庫",
-              "総在庫", "botFBA在庫日数", "bot総在庫日数", "bot在庫切れ予想(総)",
-              "bot推奨アクション"]
+              "総在庫", "botFBA在庫日数", "シート在庫日数(ココ)", "bot総在庫日数",
+              "bot在庫切れ予想(総)", "bot推奨アクション"]
     st.dataframe(
         _apply_sev_rows(_style_commas(alerts[_acols]), "bot優先度"),
         use_container_width=True, hide_index=True, height=min(420, 60 + 36 * len(alerts)))
@@ -247,7 +264,11 @@ _ALL_COLS = ["商品名", "サイズ", "ASIN", "SKU",
              "マイクロアルジェAmazon在庫", "マイクロアルジェ楽天在庫",
              "自社在庫", "依頼済数量",
              "シート販売数(総)", "シート販売数(Amazon)", "シート販売数(ココ)",
-             "シート在庫日数(総)", "bot総在庫日数", "bot発注点ROP",
+             "シート在庫日数(総)", "シート在庫日数(Amazon)", "シート在庫日数(ココ)",
+             "botFBA在庫日数", "bot総在庫日数", "bot発注点ROP",
+             "シート在庫切れ(総)", "シート在庫切れ(Amazon)", "シート在庫切れ(ココ)",
+             "発注アラート", "FBA納品アラート", "ココ納品アラート", "対応済",
+             "現ロット", "発注済ロット",
              "bot優先度", "bot推奨アクション"]
 all_rows = today[[c for c in _ALL_COLS if c in today.columns]]
 q = st.text_input("絞り込み（商品名/サイズ/SKU/ASIN 部分一致）", "")
@@ -268,7 +289,9 @@ st.dataframe(_sty, use_container_width=True, hide_index=True,
              column_config=_pin_cols(["商品名", "サイズ"]),
              height=min(700, 60 + 36 * max(1, len(all_rows))))
 st.caption(f"{len(all_rows)} SKU 表示（行順は在庫管理シートと同じ・商品ごとに明暗の縞＋境界線）。"
-           "色: 🟦在庫 🟩販売 🟧在庫日数・bot指標 ／ 在庫日数セル 赤=120日未満・橙=180日未満")
+           "色: 🟦在庫 🟩販売 🟧在庫日数・bot指標 ／ 警告色: 総在庫日数 赤<120日・橙<180日、"
+           "FBA/ココ在庫日数 赤<30日・橙<45日 ／ bot列はフラグSKUのみ値あり"
+           "（全SKUのbot指標記録は次フェーズ）")
 
 # ── ③在庫推移（行=SKU × 列=日付）────────────────────────────────────────────
 st.subheader("③ 在庫推移（列=日付・新しい日付が右）")
