@@ -136,7 +136,8 @@ def build_message(result: dict) -> str:
     blocks.append(f"📦 在庫トレンド＆発注アラート ／ {brand.name} ／ {header_date}")
     blocks.append(f"全 {result['total_skus']} SKU点検 → {counts}")
     blocks.append(
-        f"基準: 発注点=日販×(LT{th.lead_time_days}+安全{th.safety_days})日"
+        f"基準: 発注点=日販×(LT+安全{th.safety_days})日"
+        f"（LTはSKUマスタ・未設定は{th.lead_time_days}日）"
         f"／FBA<{th.fba_low_days}日／加速=7日が30日の{th.accel_hot}倍超"
     )
     blocks.append("")

@@ -3,7 +3,8 @@
 
 単一の30日移動平均では直近の需要急変を拾えず欠品する——という課題に対し、
 7日 / 30日 の日販から「加速度（7日÷30日）」を見て、加速SKUは速い側のペースで
-在庫切れを再評価する。発注は一律リードタイム135日＋安全在庫で発注点(ROP)を引く。
+在庫切れを再評価する。発注はSKUマスタのリードタイム＋安全在庫で発注点(ROP)を引く
+（マスタ未設定SKUは既定LT=Thresholds.lead_time_days にフォールバック）。
 
 データソース（SKU突合）:
   - フォーマットタブ  : 在庫(FBA/ココ/自社/依頼済)・現ロット/発注済 など
@@ -22,6 +23,10 @@
   SPAPI_MARKETPLACE_ID / SPAPI_HOST
   GOOGLE_SA_JSON（SA JSON文字列）または GOOGLE_CREDENTIALS_PATH（ローカル用ファイル）
   SALES_SHEET_ID（対象在庫シートID＝機密。secretで渡す）
+  SNAPSHOT_SHEET_ID（任意。蓄積先スプシID。設定時は🧩SKUマスタdraftタブから
+    SKU別LT/専用品目/構成数を読む。未設定なら従来動作=一律LT・サイズ文字列換算）
+  UNIT_CHECK_SHEET_ID（任意。『単袋単位の在庫切れ予想』スプシID。設定時は
+    bot単袋換算とシート数式の一致チェックを行い、乖離をwarn出力）
   CHATWORK_TOKEN / CHATWORK_ROOM_ID
 """
 from __future__ import annotations
@@ -179,8 +184,17 @@ def sheet_clear(token: str, sheet_id: str, rng: str) -> None:
 def load_format(token: str, sheet_id: str, brand) -> list[dict]:
     title = resolve_title(token, sheet_id, brand.format_gid)
     start = brand.format_data_start_row
-    # AZ まで広く読む（悩み解決ラボはマイクロアルジェ列増設で sku_comment が AO=40。
-    # 旧 A:AN=39 止まりだと範囲外で欠落するため AZ に拡張。空列は無害）。
+    # ヘッダ行を突合して列の挿入/削除を検知（不一致なら fail-loud）。
+    # 2026-08-17: labo でAD「数量」列挿入により sku_comment が「数量」列を読み
+    # 終売判定がサイレント停止していた。誤列のまま判定を続けるより止める。
+    if brand.header_expect:
+        hrow = start - 1
+        head = sheet_read(token, sheet_id, _a1(title, f"A{hrow}:AZ{hrow}"))
+        issues = brands_mod.verify_format_headers(head[0] if head else [], brand)
+        if issues:
+            raise RuntimeError("フォーマット列ズレ検知: " + " / ".join(issues))
+    # AZ まで広く読む（悩み解決ラボはマイクロアルジェ列増設＋AD数量列で
+    # sku_comment が AP=41。旧 A:AN=39 止まりだと範囲外で欠落するため AZ に拡張）。
     rows = sheet_read(token, sheet_id, _a1(title, f"A{start}:AZ"))
     c = brand.format_cols
     out = []
@@ -226,6 +240,97 @@ def load_ne(token: str, sheet_id: str, brand) -> dict:
     return m
 
 
+# ── SKUマスタ（蓄積先スプシの🧩SKUマスタdraftタブ）──────────────────────────
+MASTER_TAB = "🧩SKUマスタdraft"
+# 列: A商品名 Bサイズ C ASIN D SKU E発注先 F LT(ヶ月) G LT(日) H専用品目
+#     I基準単品SKU J構成数 K LT根拠 L販売30d M確認メモ（データは4行目から）
+
+
+def load_sku_master(token: str) -> dict:
+    """SKU別マスタ（LT日数・専用品目・基準単品SKU・構成数）を読む。
+
+    SNAPSHOT_SHEET_ID 未設定なら空dict＝従来動作（一律LT・サイズ文字列換算）。
+    設定済みで読めない/空の場合は fail-loud（誤ったLT・構成のまま判定しない）。
+    """
+    sid = os.getenv("SNAPSHOT_SHEET_ID", "")
+    if not sid:
+        print("[info] SNAPSHOT_SHEET_ID未設定→SKUマスタなし（一律LT・サイズ換算で動作）")
+        return {}
+    rows = sheet_read(token, sid, _a1(MASTER_TAB, "A4:J"))
+    m = {}
+    for r in rows:
+        sku = _cell(r, 3).strip()
+        if not sku:
+            continue
+        m[sku] = {
+            "lt_days": _to_int(_cell(r, 6)),
+            "dedicated": _cell(r, 7).strip().upper() == "TRUE",
+            "base_sku": _cell(r, 8).strip(),
+            "unit_qty": _to_int(_cell(r, 9)),
+        }
+    if not m:
+        raise RuntimeError(
+            f"SKUマスタ '{MASTER_TAB}' が0行（SNAPSHOT_SHEET_ID設定済み）→タブ名/内容を確認")
+    n_lt = sum(1 for v in m.values() if v["lt_days"])
+    print(f"[info] SKUマスタ読込: {len(m)}SKU / LT設定{n_lt}件")
+    return m
+
+
+# ── 単袋換算の一致チェック（並行計算の突合）─────────────────────────────────
+# botの単袋換算（マスタ構成数×在庫）は、既存スプシ『単袋単位の在庫切れ予想＆
+# 出荷依頼数確認表』の数式と同じ会計概念の独立計算にあたるため、一致アサーションを
+# 置く（同一概念の並行計算禁止ルール）。乖離はwarn出力（アラート本体は止めない）。
+UNIT_TAB_BY_BRAND = {"labo": "悩み解決ラボ", "nature": "LUBEE", "qiera": "Qiera"}
+
+
+def unit_parity_check(token: str, brand, fmt_rows: list, master: dict) -> None:
+    sid = os.getenv("UNIT_CHECK_SHEET_ID", "")
+    tab = UNIT_TAB_BY_BRAND.get(brand.key)
+    if not sid or not master or not tab:
+        return
+    try:
+        rows = sheet_read(token, sid, _a1(tab, "A1:J"))
+        # 単袋シート: A商品名 Bサイズ C在庫合計 D単袋換算(依頼済み込み) …（基準行のみ値あり）。
+        # bot の stock_total（フォーマットE列）は依頼済み数量込みのため、突合先は
+        # D列（在庫合計の単袋換算）。J列（実在庫のみ）と比べると依頼済み分だけ乖離する。
+        sheet_bags = {}
+        for r in rows:
+            m = re.search(r"[\d,]+", str(_cell(r, 3)))
+            if m:
+                sheet_bags[(_cell(r, 0).strip(), _cell(r, 1).strip())] = \
+                    int(m.group().replace(",", ""))
+        # bot側: マスタの基準単品SKUでプール化し Σ(在庫合計×構成数)
+        pools: dict[str, list] = {}
+        for s in fmt_rows:
+            mm = master.get(s["sku"])
+            # 専用品目は単袋シートの「30日袋換算」規約と単位が異なるため突合対象外
+            # （例: エクオルピュア90日はbot=専用袋数、シート=30日袋×3換算）。
+            if not mm or mm.get("dedicated"):
+                continue
+            pools.setdefault(mm.get("base_sku") or s["product"], []).append(s)
+        checked = ng = 0
+        for members in pools.values():
+            bags = sum((s["stock_total"] or 0) *
+                       ((master[s["sku"]].get("unit_qty")) or _parse_mult(s["size"]))
+                       for s in members)
+            bkey = min(members,
+                       key=lambda s: master[s["sku"]].get("unit_qty") or _parse_mult(s["size"]))
+            key = (bkey["product"], bkey["size"])
+            if key not in sheet_bags or bags <= 0:
+                continue
+            checked += 1
+            ref = sheet_bags[key]
+            if ref and abs(bags - ref) / ref > 0.02:
+                ng += 1
+                print(f"[warn] 単袋換算乖離 {key[0]}({key[1]}): "
+                      f"bot={bags:,}袋 / 単袋シート={ref:,}袋（±2%超）")
+        print(f"[info] 単袋換算一致チェック: {checked}品目中 乖離{ng}件"
+              + ("" if ng == 0 else " → マスタ構成数 or 単袋シート数式を確認"))
+    except Exception as e:
+        print(f"[warn] 単袋換算一致チェック失敗（本体継続）: "
+              f"{type(e).__name__}: {str(e)[:160]}")
+
+
 # ── Amazon 7d / 30d（SP-API）────────────────────────────────────────────────
 def fetch_amazon_windows(sp_token: str, today0: datetime, now: datetime) -> tuple[dict, dict]:
     def window(days):
@@ -250,13 +355,16 @@ def _parse_mult(size: str) -> int:
     return int(m.group()) if m else 1
 
 
-def analyze(brand, fmt_rows, ne_map, amz7, amz30, today, use_spapi):
+def analyze(brand, fmt_rows, ne_map, amz7, amz30, today, use_spapi, master=None):
     """SKU別に在庫・販売を評価しフラグ付きSKUを返す。
 
     FBA納品 / ココ補充 / 加速注意 は SKU(出品ASIN)単位。
-    製造発注 / 過剰在庫 は商品単位（1個/2個/3個を単品換算で合算し基準SKUに付与）。
+    製造発注 / 過剰在庫 は品目単位。SKUマスタがあれば基準単品SKUで束ね
+    （専用品目=独立プール）、構成数で単袋換算して基準SKUに付与。
+    マスタ無しは従来通り商品名で束ね、サイズ文字列の数字を倍率にする。
     """
     th = brand.thresholds
+    master = master or {}
     metrics = []
     for s in fmt_rows:
         if "終売" in s["sku_comment"]:
@@ -290,9 +398,13 @@ def analyze(brand, fmt_rows, ne_map, amz7, amz30, today, use_spapi):
         days_coco = stock_coco / ve_c if (ve_c and ve_c > 0) else None
         stockout_fba = today + timedelta(days=days_fba) if days_fba is not None else None
 
+        mm = master.get(sku)
         m = dict(s)
         m.update({
-            "mult": _parse_mult(s["size"]),
+            # 単袋換算倍率: マスタの構成数を優先（30日分=1, 60日分=2 …の実倍率）。
+            # マスタ無しSKUはサイズ文字列の数字（30/60/90等）。分子分母で同じ係数が
+            # 掛かるため在庫日数比は正しいが、絶対量（在庫N本表示）はマスタ時のみ正確。
+            "mult": (mm.get("unit_qty") if mm else None) or _parse_mult(s["size"]),
             "stock_fba": stock_fba, "stock_coco": stock_coco, "stock_own": stock_own,
             "stock_total": stock_total, "requested_qty": requested,
             "amazon_7d": a7, "amazon_30d": a30, "coco_7d": c7, "coco_30d": c30,
@@ -305,12 +417,26 @@ def analyze(brand, fmt_rows, ne_map, amz7, amz30, today, use_spapi):
         _fulfillment_triggers(m, th)
         metrics.append(m)
 
-    # 製造発注・過剰在庫は商品単位（パックを単品換算で合算）で基準SKUに付与
+    # 製造発注・過剰在庫は品目単位（パックを単袋換算で合算）で基準SKUに付与。
+    # 束ねキーはマスタの基準単品SKU（専用品目は自分自身が基準=独立プール。
+    # 例: エクオルピュア90日分 B0BWWN3D9Q は専用大容量サイズで単品プールと別製造）。
+    # マスタ未登録SKUは従来通り商品名で束ねる。
     groups: dict[str, list] = {}
     for m in metrics:
-        groups.setdefault(m["product"], []).append(m)
+        mm = master.get(m["sku"])
+        if mm and mm.get("dedicated"):
+            gkey = m["sku"]  # 専用品目は常に独立プール（base_sku誤設定でも混ぜない）
+        elif mm:
+            gkey = mm.get("base_sku") or m["product"]
+        else:
+            gkey = m["product"]
+        groups.setdefault(gkey, []).append(m)
     for rows in groups.values():
-        _order_triggers(rows, th, today, use_spapi)
+        # 品目LT: グループ内マスタLTの最大値（保守的）。無ければ既定LTで従来挙動。
+        lts = [master[x["sku"]]["lt_days"] for x in rows
+               if x["sku"] in master and master[x["sku"]]["lt_days"]]
+        _order_triggers(rows, th, today, use_spapi,
+                        lt_days=max(lts) if lts else None)
 
     results = [m for m in metrics if m["triggers"]]
     for m in results:
@@ -364,9 +490,19 @@ def _fulfillment_triggers(m, th):
         m["triggers"].append({"kind": "TREND", "sev": "🔺", "action": act, "reason": "・".join(which)})
 
 
-def _order_triggers(rows, th, today, use_spapi):
-    """商品単位: パックを単品換算で合算し、基準SKU(最小サイズ)に製造発注/過剰を付与。"""
+def _order_triggers(rows, th, today, use_spapi, lt_days=None):
+    """品目単位: パックを単袋換算で合算し、基準SKU(最小サイズ)に製造発注/過剰を付与。
+
+    lt_days: SKUマスタ由来の品目別リードタイム（日）。None なら既定LT。
+    発注sevの閾値は「既定LTでの指定値(order_urgent/warn_days)を、LT差分だけ
+    平行移動」する＝既定LTのとき従来挙動と完全一致（閾値の絶対オフセット維持）。
+    """
     base = min(rows, key=lambda m: m["mult"])
+    lt = lt_days if lt_days is not None else th.lead_time_days
+    cover = lt + th.safety_days                       # 発注点の在庫日数カバー
+    lt_shift = cover - (th.lead_time_days + th.safety_days)
+    urgent_days = th.order_urgent_days + lt_shift
+    warn_days = th.order_warn_days + lt_shift
 
     def wsum(field):  # 単品換算の加重合計（pack×倍率）
         return sum((m[field] or 0) * m["mult"] for m in rows)
@@ -387,7 +523,7 @@ def _order_triggers(rows, th, today, use_spapi):
     ve_c = _eff_velocity(v7c, v30c, accel_c, th.accel_hot)
     total_eff = (ve_a or 0) + (ve_c or 0)
     days_total = base_stock / total_eff if total_eff > 0 else None  # 現物枯渇日数（製品計）
-    rop = total_eff * (th.lead_time_days + th.safety_days) if total_eff > 0 else None
+    rop = total_eff * cover if total_eff > 0 else None
 
     base["days_total"] = days_total
     base["rop"] = rop
@@ -396,16 +532,16 @@ def _order_triggers(rows, th, today, use_spapi):
 
     ordered = any(m["lot_ordered"] for m in rows)
     if not ordered and days_total is not None:
-        sev = ("🚨" if days_total < th.order_urgent_days
-               else "🔴" if days_total < th.order_warn_days else None)
+        sev = ("🚨" if days_total < urgent_days
+               else "🔴" if days_total < warn_days else None)
         if sev:
-            label = th.order_urgent_days if sev == "🚨" else th.order_warn_days
+            label = urgent_days if sev == "🚨" else warn_days
             verb = "至急製造発注" if sev == "🚨" else "製造発注を検討"
             act = f"{verb}。製品計 物理在庫{days_total:.0f}日（{label}日未満）・在庫{base_stock:,}本。"
             if base["order_lot"]:
                 act += f" 推奨ロット目安{base['order_lot']:,}。"
             base["triggers"].append({"kind": "ORDER", "sev": sev, "action": act,
-                "reason": (f"製品計物理{days_total:.0f}日/ROP{rop:,.0f}" if rop
+                "reason": (f"製品計物理{days_total:.0f}日/ROP{rop:,.0f}(LT{lt}日)" if rop
                            else f"製品計物理{days_total:.0f}日")})
     elif any(m["alert_order"] for m in rows) and not ordered:
         base["triggers"].append({"kind": "ORDER", "sev": "🔴",
@@ -610,6 +746,7 @@ def main() -> int:
     gtok = sheets_token()
     fmt_rows = load_format(gtok, sheet_id, brand)
     ne_map = load_ne(gtok, sheet_id, brand)
+    sku_master = load_sku_master(gtok)
     print(f"[info] {brand.name}: フォーマット{len(fmt_rows)}SKU / NE{len(ne_map)}SKU")
 
     # データ健全性チェック（サイレント障害検知）。失敗しても本体は止めない。
@@ -660,10 +797,12 @@ def main() -> int:
                   f"{type(e).__name__}: {str(e)[:120]}")
             use_spapi = False
 
-    result = analyze(brand, fmt_rows, ne_map, amz7, amz30, now, use_spapi)
+    result = analyze(brand, fmt_rows, ne_map, amz7, amz30, now, use_spapi,
+                     master=sku_master)
     result["sheet_url"] = brands_mod.sheet_url(sheet_id, brand.format_gid)
     flagged = len(result["results"])
     print(f"[info] フラグSKU={flagged}")
+    unit_parity_check(gtok, brand, fmt_rows, sku_master)
 
     body = inventory_format.build_message(result)
 

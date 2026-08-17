@@ -52,6 +52,10 @@ jobs:
           SPAPI_HOST: ${{ secrets.SPAPI_HOST }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SALES_SHEET_ID: ${{ secrets.SALES_SHEET_ID }}
+          # SKU別マスタ（LT/専用品目/構成数）= 蓄積先スプシの🧩SKUマスタdraftタブ
+          SNAPSHOT_SHEET_ID: ${{ secrets.SNAPSHOT_SHEET_ID }}
+          # 単袋換算の一致チェック先=『単袋単位の在庫切れ予想＆出荷依頼数確認表』
+          UNIT_CHECK_SHEET_ID: ${{ secrets.UNIT_CHECK_SHEET_ID }}
           CHATWORK_TOKEN: ${{ secrets.CHATWORK_TOKEN }}
           # 投稿先=【サドナレ】業務メンバーチャット(room 393394277)。
           CHATWORK_ROOM_ID: ${{ secrets.CHATWORK_ROOM_ID_LABO_INV }}

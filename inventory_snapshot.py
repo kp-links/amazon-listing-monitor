@@ -333,6 +333,13 @@ def load_format_rows(token: str, sheet_id: str, brand, extra: dict) -> list[dict
     """フォーマットタブを生値で読む（inventory_alert.load_format とは別物：
     あちらは計算に要る列だけを型変換して返す。こちらは履歴として残す列を広く拾う）。"""
     title = resolve_title(token, sheet_id, brand.format_gid)
+    # 列の挿入/削除の検知（2026-08-17 laboのAD列挿入で発注ロット数が誤列を記録）。
+    # 蓄積を止めると履歴が永久欠損するため警告のみ（alert側は同検証で fail-loud）。
+    if brand.header_expect:
+        hrow = brand.format_data_start_row - 1
+        head = sheet_read(token, sheet_id, _a1(title, f"A{hrow}:AZ{hrow}"))
+        for issue in brands_mod.verify_format_headers(head[0] if head else [], brand):
+            print(f"[warn] {issue}（蓄積は継続・列マップ要修正）", file=sys.stderr)
     rows = sheet_read(token, sheet_id,
                       _a1(title, f"A{brand.format_data_start_row}:AZ"))
     c = brand.format_cols

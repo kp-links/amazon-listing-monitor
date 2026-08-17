@@ -60,6 +60,8 @@ NATURE_NE_COLS = {"sku": 3, "coco_7d": 4, "coco_30d": 5}
 
 # 悩み解決ラボ「フォーマットv2」(gid=1674969562)。マイクロアルジェ在庫(H,I)が増設
 # され、ナチュレ比で自社(J)以降が右に2列ずれる。直近販売数=L(総)/M(Amazon)/N(ココ)。
+# さらにナチュレでは1列の「納品予定タイミング、数量」が AC(タイミング)+AD(数量) に
+# 分割されており、AE(発注ロット)以降はナチュレ比+1列（2026-08-17 実シート再検証）。
 LABO_FORMAT_COLS = {
     "product": 0, "size": 1, "asin": 2, "sku": 3,
     "stock_total": 4, "stock_fba": 5, "stock_coco": 6,
@@ -71,11 +73,12 @@ LABO_FORMAT_COLS = {
     "stockout_total": 17, "stockout_amazon": 18, "stockout_coco": 19,
     "delivery_deadline": 20, "repeat_order_deadline": 21,
     "alert_order": 22, "alert_fba": 23, "alert_coco": 24, "alert_done": 25,
-    "lot_current": 26, "lot_ordered": 27, "delivery_plan": 28, "order_lot": 29,
-    "new_lot_assign": 30, "aerologi": 31, "set_assembly": 32, "order_consider": 33,
-    "amazon_todo_date": 34, "amazon_todo": 35, "amazon_todo_qty": 36,
-    "coco_todo_date": 37, "coco_todo": 38, "coco_todo_qty": 39,
-    "sku_comment": 40,
+    "lot_current": 26, "lot_ordered": 27,
+    "delivery_plan": 28, "delivery_plan_qty": 29, "order_lot": 30,
+    "new_lot_assign": 31, "aerologi": 32, "set_assembly": 33, "order_consider": 34,
+    "amazon_todo_date": 35, "amazon_todo": 36, "amazon_todo_qty": 37,
+    "coco_todo_date": 38, "coco_todo": 39, "coco_todo_qty": 40,
+    "sku_comment": 41,
 }
 # Qiera「フォーマット」(gid=1674969562)。ナチュレ同型だが「ラベル」列が無く、
 # 新ロット振り分け以降が1列詰まる。sku_comment は AM(38)。
@@ -97,6 +100,33 @@ QIERA_FORMAT_COLS = {
 # ココ7d/30d タブ（labo=RSL売上状況 / qiera=NE売上状況）。列構造はナチュレと同一。
 LABO_NE_COLS = {"sku": 3, "coco_7d": 4, "coco_30d": 5}
 QIERA_NE_COLS = {"sku": 3, "coco_7d": 4, "coco_30d": 5}
+
+# フォーマットのヘッダ実行時検証（{列index: ヘッダに含まれるべき文字列}）。
+# 2026-08-17 に labo で AD「数量」列の挿入により order_lot 以降が+1ズレ、
+# sku_comment が「数量」列を読んで終売判定がサイレント停止していた事故の再発防止。
+# 位置ズレに気づきやすい後方の列を中心に張る。実ヘッダは 2026-08-17 実シート検証値。
+NATURE_HEADER_EXPECT = {0: "商品名", 3: "SKU", 27: "発注ロット",
+                        31: "セット組み依頼", 39: "SKU全体コメント"}
+LABO_HEADER_EXPECT = {0: "商品名", 3: "SKU", 30: "発注ロット",
+                      33: "セット組み依頼", 41: "SKU全体コメント"}
+QIERA_HEADER_EXPECT = {0: "商品名", 3: "SKU", 27: "発注ロット",
+                       30: "セット組み依頼", 38: "SKU全体コメント"}
+
+
+def verify_format_headers(header_row: list, brand) -> list[str]:
+    """フォーマットのヘッダ行を header_expect と突合し、不一致の説明文リストを返す。
+
+    呼び出し側の方針: inventory_alert は不一致で fail-loud（誤列のまま判定しない）、
+    inventory_snapshot は警告のみ（蓄積を止めると履歴が永久欠損するため）。
+    """
+    issues = []
+    for idx, expect in (brand.header_expect or {}).items():
+        got = str(header_row[idx]).strip() if idx < len(header_row) else ""
+        if expect not in got:
+            issues.append(
+                f"{brand.key}: 列{idx}のヘッダが想定外（期待に'{expect}'を含む/実際='{got}'）"
+                "→列の挿入/削除の可能性。brands.py の列マップを実シートで再検証すること")
+    return issues
 
 # 健全性チェック対象のソースタブ（sheet_health.py が毎朝点検）。
 # ⚠️ gid・キー列はブランドごとに実シートで実地検証してから追加すること。
@@ -136,6 +166,7 @@ class Brand:
     thresholds: Thresholds = field(default_factory=Thresholds)
     health_tabs: tuple = ()        # 健全性チェック対象タブ（未設定=スキップ）
     format_date_cell: str = ""     # フォーマットの基準日セル（例 "C2"。空=チェックなし）
+    header_expect: dict = field(default_factory=dict)  # {列idx: ヘッダ含有文字列}（列ズレ検知）
 
 
 # シートURLは実行時に SALES_SHEET_ID（secret）から組み立てる（IDをコードに残さない）。
@@ -157,6 +188,7 @@ BRANDS: dict[str, Brand] = {
         # ナチュレ在庫の担当メンション。誤爆防止のため確定するまで暫定で空。
         # 実運用前に [To:id]名前さん 形式で設定する。
         chatwork_mentions="",
+        header_expect=NATURE_HEADER_EXPECT,
     ),
     "labo": Brand(
         key="labo",
@@ -171,6 +203,7 @@ BRANDS: dict[str, Brand] = {
         chatwork_mentions="",           # 配信先=【サドナレ】業務メンバーチャット
         health_tabs=LABO_HEALTH_TABS,
         format_date_cell="C2",          # 更新日（在庫切れ予想日の起点）
+        header_expect=LABO_HEADER_EXPECT,
     ),
     "qiera": Brand(
         key="qiera",
@@ -183,6 +216,7 @@ BRANDS: dict[str, Brand] = {
         ne_data_start_row=3,
         rec_tab_title="📊在庫アラート(bot)",
         chatwork_mentions="",           # 配信先=【Qiera】社内物流チャット
+        header_expect=QIERA_HEADER_EXPECT,
     ),
 }
 
