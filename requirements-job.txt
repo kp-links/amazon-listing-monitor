@@ -1,0 +1,4 @@
+# Cloud Run Job（inventory_snapshot --sink parquet）専用の追加依存。
+# GitHub Actions 版（sheets sink）は requirements.txt のみで動くため分離している。
+pandas>=2.2
+pyarrow>=16

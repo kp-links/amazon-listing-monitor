@@ -43,6 +43,7 @@ import os
 import sys
 import urllib.parse
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import brands as brands_mod
 from inventory_alert import resolve_title, sheets_token
@@ -125,6 +126,100 @@ def _env(name: str, default: str | None = None) -> str:
     return v
 
 
+def _token() -> str:
+    """Sheets 用アクセストークン。
+
+    GitHub Actions は GOOGLE_SA_JSON、ローカルは GOOGLE_CREDENTIALS_PATH。
+    Cloud Run はどちらも無しで ADC（ランタイムSA = pulse-runner）にフォールバック。
+    これにより Cloud Run 側では Secret の受け渡し自体が不要になる。
+    """
+    if os.getenv("GOOGLE_SA_JSON") or os.getenv("GOOGLE_CREDENTIALS_PATH"):
+        return sheets_token()
+    import google.auth
+    from google.auth.transport.requests import Request as GoogleRequest
+    creds, _ = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    creds.refresh(GoogleRequest())
+    return creds.token
+
+
+# Parquet で数値型に寄せる列。それ以外は文字列に統一する
+# （同一列に int と str が混在すると pyarrow が落ちるため、型を列単位で固定する）。
+NUM_COLS = [
+    "総在庫", "FBA在庫", "ココ在庫",
+    "マイクロアルジェAmazon在庫", "マイクロアルジェ楽天在庫",
+    "自社在庫", "依頼済数量",
+    "シート販売数(総)", "シート販売数(Amazon)", "シート販売数(ココ)",
+    "NEココ7d", "NEココ30d",
+    "シート在庫日数(総)", "シート在庫日数(Amazon)", "シート在庫日数(ココ)",
+    "発注ロット数",
+    "botA日販7d", "botA日販30d", "botコ日販7d", "botコ日販30d",
+    "botFBA在庫日数", "bot総在庫日数", "bot発注点ROP",
+]
+
+
+def write_parquet(rows: list[list], today: str, brand_key: str) -> None:
+    """月次パーティション inventory_<brand>_YYYY-MM.parquet へ追記する。
+
+    既存Pulseの流儀（seo_watch.py）に合わせ「読み込んで結合→重複除去→
+    tmpに書いて replace」。重複キーは (日付, ブランド, SKU)、keep=first で
+    先に入った記録を保持（Sheets 側の「蓄積済みはスキップ」と同じ意味論）。
+
+    ファイルは**ブランド別**。read→書き直し方式はロックが無いため、
+    複数ブランドが同一ファイルに同時に書くと後勝ちで追記が消える。
+    ファイルを分ければブランド間の競合は構造的に起きない。
+    （tmp→replace は GCS FUSE では厳密にはアトミックでないが、既存Pulseの
+    seo_watch が同パターンで実運用中のため踏襲する。）
+    """
+    import pandas as pd
+
+    root = _env("SNAPSHOT_DATA_ROOT")   # Cloud Run では /mnt/gcs/data（GCS FUSE）
+    out_dir = Path(root) / "inventory_snapshot"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    p = out_dir / f"inventory_{brand_key}_{today[:7]}.parquet"
+    keys = ["日付", "ブランド", "SKU"]
+
+    df = pd.DataFrame(rows, columns=SNAPSHOT_HEADERS)
+    for k in keys:
+        df[k] = df[k].astype(str)
+    existing: set = set()
+    if p.exists():
+        prev = pd.read_parquet(p)
+        # 旧ファイルに新列が無い場合（ヘッダ末尾追加後の初回）は空で補う
+        for c in SNAPSHOT_HEADERS:
+            if c not in prev.columns:
+                prev[c] = ""
+        prev = prev[SNAPSHOT_HEADERS]
+        # キーは文字列に正規化してから突合（型が揺れると同一SKUが重複保存される）
+        for k in keys:
+            prev[k] = prev[k].astype(str)
+        existing = set(map(tuple, prev[keys].values))
+        df = pd.concat([prev, df], ignore_index=True)
+    df = df.drop_duplicates(subset=keys, keep="first")
+    added = len(set(map(tuple, df[keys].values)) - existing)
+
+    for c in df.columns:
+        if c in NUM_COLS:
+            num = pd.to_numeric(df[c], errors="coerce")
+            lost = int((num.isna() & df[c].notna()
+                        & df[c].astype(str).str.strip().ne("")
+                        & df[c].astype(str).ne("nan")).sum())
+            if lost:
+                # '#DIV/0!' 等の生値は NaN になる。Sheets 側には生値が残るので
+                # 消えっぱなしにはならないが、黙って落とさずログには出す
+                print(f"[warn] parquet: 列'{c}' で数値化できない値 {lost}件を NaN 化",
+                      file=sys.stderr)
+            df[c] = num
+        else:
+            df[c] = df[c].fillna("").astype(str)
+
+    tmp = p.with_suffix(".parquet.tmp")
+    df.to_parquet(tmp, index=False)
+    tmp.replace(p)
+    print(f"[ok] parquet: {p.name} へ {added}行を追記"
+          f"（重複スキップ {len(rows) - added} / ファイル計 {len(df)}行）")
+
+
 def _status_of(e: Exception) -> int | None:
     resp = getattr(e, "response", None)
     return getattr(resp, "status_code", None) if resp is not None else None
@@ -164,6 +259,15 @@ def sa_identity() -> str:
             with open(path, encoding="utf-8") as f:
                 return json.load(f).get("client_email", "(不明)")
     except Exception:  # noqa: BLE001 — 診断用途なので失敗しても本処理は続ける
+        pass
+    try:
+        # Cloud Run（ADC）: ランタイムSAのアドレスを取る（refresh前は "default" のことがある）
+        import google.auth
+        creds, _ = google.auth.default()
+        email = getattr(creds, "service_account_email", "")
+        if email:
+            return f"{email} (ADC)"
+    except Exception:  # noqa: BLE001
         pass
     return "(不明)"
 
@@ -460,24 +564,32 @@ def main() -> int:
                     help="読み取りと組み立てだけ行い、書き込まない")
     ap.add_argument("--show-sample", action="store_true",
                     help="dry-run 時に先頭行を表示（業務データが出るのでローカル専用）")
+    ap.add_argument("--sink", choices=["sheets", "parquet", "both"],
+                    default=os.getenv("SNAPSHOT_SINK", "sheets"),
+                    help="書き込み先。GitHub Actions=sheets / Cloud Run=parquet。"
+                         "parity 検証中は両系を並走させ、確認後に sheets 系を停止する")
     args = ap.parse_args()
 
     if not args.brand:
         raise SystemExit("[FATAL] --brand か環境変数 BRAND が必要")
     brand = brands_mod.get_brand(args.brand)
+    to_sheets = args.sink in ("sheets", "both")
+    to_parquet = args.sink in ("parquet", "both")
 
     src_id = _env("SALES_SHEET_ID")
-    dst_id = "" if args.dry_run else _env("SNAPSHOT_SHEET_ID")
+    dst_id = "" if (args.dry_run or not to_sheets) else _env("SNAPSHOT_SHEET_ID")
     if dst_id and dst_id == src_id:
         raise SystemExit(
             "[FATAL] SNAPSHOT_SHEET_ID が読み取り元と同一。"
             "在庫管理シート本体には書き込まない方針のため中止する")
+    if to_parquet and not args.dry_run:
+        _env("SNAPSHOT_DATA_ROOT")   # 早期に検証（読み取り後に落ちると無駄になる）
 
     now = datetime.now(JST)
     today = now.strftime("%Y-%m-%d")
     fetched_at = now.strftime("%Y-%m-%d %H:%M JST")
 
-    token = sheets_token()
+    token = _token()
     print(f"[info] 実行SA: {sa_identity()}"
           "（蓄積先シートにこのアドレスを編集者で共有していないと 403 になる）")
     extra = verify_extra_cols(token, src_id, brand)
@@ -499,20 +611,24 @@ def main() -> int:
             print("[dry-run] 先頭行:", rows[0][:10])
         return 0
 
-    ensure_snapshot_tab(token, dst_id)
-    done, dates = existing_skus(token, dst_id, brand.key, today)
-    warn_on_gap(dates, brand.key, today)
+    if to_parquet:
+        write_parquet(rows, today, brand.key)
 
-    pending = [r for r in rows if r[SKU_AT] not in done]
-    if not pending:
-        print(f"[info] {today} / {brand.key}: {len(done)}SKU すべて蓄積済み。スキップ")
-        return 0
-    if done:
-        print(f"[info] {today} / {brand.key}: {len(done)}SKU は蓄積済み。"
-              f"欠けている {len(pending)}SKU を補完する")
+    if to_sheets:
+        ensure_snapshot_tab(token, dst_id)
+        done, dates = existing_skus(token, dst_id, brand.key, today)
+        warn_on_gap(dates, brand.key, today)
 
-    append_rows(token, dst_id, pending)
-    print(f"[ok] {today} / {brand.key}: {len(pending)}行を追記した")
+        pending = [r for r in rows if r[SKU_AT] not in done]
+        if not pending:
+            print(f"[info] {today} / {brand.key}: {len(done)}SKU すべて蓄積済み。スキップ")
+            return 0
+        if done:
+            print(f"[info] {today} / {brand.key}: {len(done)}SKU は蓄積済み。"
+                  f"欠けている {len(pending)}SKU を補完する")
+
+        append_rows(token, dst_id, pending)
+        print(f"[ok] {today} / {brand.key}: {len(pending)}行を追記した")
     return 0
 
 
