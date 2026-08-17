@@ -45,6 +45,34 @@ _SEV = {"🚨": 0, "🔴": 1, "🟡": 2, "🔺": 3, "🔻": 4}   # inventory_for
 # 識別子列はカンマ整形の対象外（JAN型の数字SKU等にカンマが付くと識別子が壊れる）
 _ID_COLS = {"SKU", "ASIN", "商品名", "サイズ", "日付"}
 
+# ── 配色（推奨事項タブ inventory_alert.SEV_BG と同じ視覚言語。色はステータスの
+#    補助であり、優先度絵文字・数値が主情報＝色単独に依存しない）─────────────
+_INK = "#1a1a1a"                       # 背景を塗るセルは文字色も固定（ダークテーマ対策）
+_SEV_BG = {"🚨": "#ffe0e0", "🔴": "#fff1dc", "🟡": "#fffbd6",
+           "🔺": "#e3efff", "🔻": "#f0f0f0"}
+_TINT_STOCK = "#eef5ff"    # 在庫ブロック（薄青）
+_TINT_SALES = "#edf7ed"    # 販売ブロック（薄緑）
+_TINT_DAYS = "#fff5e6"     # 在庫日数/bot指標ブロック（薄橙）
+_DAYS_URGENT = "#ffd2d2"   # 在庫日数<120日
+_DAYS_WARN = "#ffe8c2"     # 在庫日数<180日
+
+
+def _cellmap(sty, fn, subset):
+    """pandas 2.1 で applymap→map に改名されたための互換ラッパ。"""
+    mapper = getattr(sty, "map", None) or getattr(sty, "applymap")
+    return mapper(fn, subset=subset)
+
+
+def _isnum(v) -> bool:
+    """numpy.int64/float64 を含む数値判定（bool除外・NaN除外）。"""
+    import numbers
+    return (isinstance(v, numbers.Number) and not isinstance(v, bool)
+            and not pd.isna(v))
+
+
+def _bg(color: str, extra: str = "") -> str:
+    return f"background-color:{color};color:{_INK}" + (f";{extra}" if extra else "")
+
 
 def _style_commas(frame: pd.DataFrame):
     """数値列をカンマ区切り（小数切捨て表示）で整形した Styler を返す。
@@ -65,6 +93,73 @@ def _style_commas(frame: pd.DataFrame):
         if pd.api.types.is_numeric_dtype(out[col]):
             fmt[col] = "{:,.0f}"
     return out.style.format(fmt, na_rep="")
+
+
+def _apply_sev_rows(sty, sev_col: str):
+    """優先度列の値に応じて行全体に薄い背景を敷く（推奨事項タブと同配色）。"""
+    def _row(row):
+        c = _SEV_BG.get(str(row.get(sev_col, "")).strip())
+        return [_bg(c) if c else "" for _ in row]
+    return sty.apply(_row, axis=1)
+
+
+def _apply_group_tints(sty, cols):
+    """列グループの薄背景（在庫=薄青/販売=薄緑/日数・bot指標=薄橙）。"""
+    groups = [
+        (["総在庫", "FBA在庫", "ココ在庫", "マイクロアルジェAmazon在庫",
+          "マイクロアルジェ楽天在庫", "自社在庫", "依頼済数量"], _TINT_STOCK),
+        (["シート販売数(総)", "シート販売数(Amazon)", "シート販売数(ココ)"], _TINT_SALES),
+        (["シート在庫日数(総)", "bot総在庫日数", "bot発注点ROP"], _TINT_DAYS),
+    ]
+    for names, tint in groups:
+        subset = [c for c in names if c in cols]
+        if subset:
+            sty = sty.set_properties(subset=subset,
+                                     **{"background-color": tint, "color": _INK})
+    return sty
+
+
+def _apply_days_alert(sty, cols):
+    """在庫日数セルの警告色（<120日=赤/<180日=橙。閾値は発注sevと同じ既定値）。"""
+    def _cell(v):
+        if not _isnum(v):
+            return ""
+        if v < 120:
+            return _bg(_DAYS_URGENT, "font-weight:600")
+        if v < 180:
+            return _bg(_DAYS_WARN)
+        return ""
+    subset = [c for c in ("シート在庫日数(総)", "bot総在庫日数") if c in cols]
+    return _cellmap(sty, _cell, subset) if subset else sty
+
+
+def _apply_heat(sty, frame: pd.DataFrame, cols):
+    """推移ピボットの単色濃淡ヒートマップ（白→薄青、表全体でmin-max正規化）。
+
+    文字は常に _INK＝濃色側でも可読な明度域（白〜#a9c9f5）に収める。
+    """
+    vals = frame[cols].apply(pd.to_numeric, errors="coerce")
+    vmin, vmax = vals.min().min(), vals.max().max()
+    span = (vmax - vmin) or 1.0
+
+    def _cell(v):
+        if not _isnum(v):
+            return ""
+        t = max(0.0, min(1.0, (v - vmin) / span))
+        r = round(255 - (255 - 169) * t)   # 255→169 (#a9)
+        g = round(255 - (255 - 201) * t)   # 255→201 (#c9)
+        bl = round(255 - (255 - 245) * t)  # 255→245 (#f5)
+        return _bg(f"rgb({r},{g},{bl})")
+    return _cellmap(sty, _cell, [c for c in cols])
+
+
+def _apply_delta(sty, col):
+    """Δ期間: 減=薄赤/増=薄緑（ゼロ・欠損は無色）。"""
+    def _cell(v):
+        if not _isnum(v) or v == 0:
+            return ""
+        return _bg("#ffd9d9" if v < 0 else "#d9f0dd")
+    return _cellmap(sty, _cell, [col])
 
 
 @st.cache_data(ttl=600)
@@ -111,10 +206,11 @@ st.subheader("① 今日の在庫アラート（bot算出・優先度順）")
 if alerts.empty:
     st.success("フラグの立っているSKUはありません")
 else:
+    _acols = ["bot優先度", "bot区分", "商品名", "サイズ", "FBA在庫", "ココ在庫",
+              "総在庫", "botFBA在庫日数", "bot総在庫日数", "bot在庫切れ予想(総)",
+              "bot推奨アクション"]
     st.dataframe(
-        _style_commas(alerts[["bot優先度", "bot区分", "商品名", "サイズ", "FBA在庫",
-                              "ココ在庫", "総在庫", "botFBA在庫日数", "bot総在庫日数",
-                              "bot在庫切れ予想(総)", "bot推奨アクション"]]),
+        _apply_sev_rows(_style_commas(alerts[_acols]), "bot優先度"),
         use_container_width=True, hide_index=True, height=min(420, 60 + 36 * len(alerts)))
 
 # ── ②全SKU一覧（今日・シートと同じ並び）──────────────────────────────────────
@@ -135,9 +231,16 @@ if q.strip():
             mask |= all_rows[c].astype(str).str.contains(
                 q.strip(), case=False, na=False, regex=False)
     all_rows = all_rows[mask]
-st.dataframe(_style_commas(all_rows), use_container_width=True, hide_index=True,
+_sty = _style_commas(all_rows)
+_sty = _apply_group_tints(_sty, all_rows.columns)
+_sty = _apply_days_alert(_sty, all_rows.columns)
+if "bot優先度" in all_rows.columns:
+    _sty = _cellmap(_sty, lambda v: _bg(_SEV_BG[str(v).strip()])
+                    if str(v).strip() in _SEV_BG else "", ["bot優先度"])
+st.dataframe(_sty, use_container_width=True, hide_index=True,
              height=min(700, 60 + 36 * max(1, len(all_rows))))
-st.caption(f"{len(all_rows)} SKU 表示（行順は在庫管理シートと同じ）")
+st.caption(f"{len(all_rows)} SKU 表示（行順は在庫管理シートと同じ）。"
+           "色: 🟦在庫 🟩販売 🟧在庫日数・bot指標 ／ 在庫日数セル 赤=120日未満・橙=180日未満")
 
 # ── ③在庫推移（行=SKU × 列=日付）────────────────────────────────────────────
 st.subheader("③ 在庫推移（列=日付・新しい日付が右）")
@@ -152,7 +255,13 @@ if len(pv.columns) >= 2:
     pv["Δ期間"] = pv[last] - pv[first]
 pv = pv.sort_values(pv.columns[-2] if "Δ期間" in pv.columns else pv.columns[-1],
                     na_position="last")
-st.dataframe(_style_commas(pv.reset_index()), use_container_width=True,
-             hide_index=True, height=560)
-st.caption("並び順は最新値の昇順（少ない・危ないものが上）。Δ期間 = 最新 − 蓄積初日。"
+pv_flat = pv.reset_index()
+date_cols = [c for c in pv_flat.columns if c not in ("商品名", "サイズ", "Δ期間")]
+_psty = _style_commas(pv_flat)
+_psty = _apply_heat(_psty, pv_flat, date_cols)
+if "Δ期間" in pv_flat.columns:
+    _psty = _apply_delta(_psty, "Δ期間")
+st.dataframe(_psty, use_container_width=True, hide_index=True, height=560)
+st.caption("並び順は最新値の昇順（少ない・危ないものが上）。Δ期間 = 最新 − 蓄積初日"
+           "（薄赤=減少・薄緑=増加）。濃淡=値の大小（表全体で正規化）。"
            "蓄積が貯まるほど推移の解像度が上がります。")
