@@ -29,8 +29,8 @@ GitHub Actions で15分毎にクラウド実行（PCオフでも動く）。SP-A
 環境変数（GitHub Actions secrets から注入）:
   SPAPI_REFRESH_TOKEN / SPAPI_LWA_CLIENT_ID / SPAPI_LWA_CLIENT_SECRET
   SPAPI_MARKETPLACE_ID (例 A1VC38T7YXB528) / SPAPI_HOST (例 sellingpartnerapi-fe.amazon.com)
-  OWN_SELLER_ID (例 A308PH94VO9URO)
-  CHATWORK_TOKEN / CHATWORK_ROOM_ID (例 439649765)
+  OWN_SELLER_ID
+  CHATWORK_TOKEN / CHATWORK_ROOM_ID
   GOOGLE_SA_JSON (サービスアカウントJSON文字列) / SHEET_ID
 """
 from __future__ import annotations

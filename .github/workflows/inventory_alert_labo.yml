@@ -57,7 +57,7 @@ jobs:
           # 単袋換算の一致チェック先=『単袋単位の在庫切れ予想＆出荷依頼数確認表』
           UNIT_CHECK_SHEET_ID: ${{ secrets.UNIT_CHECK_SHEET_ID }}
           CHATWORK_TOKEN: ${{ secrets.CHATWORK_TOKEN }}
-          # 投稿先=【サドナレ】業務メンバーチャット(room 393394277)。
+          # 投稿先=【サドナレ】業務メンバーチャット。
           CHATWORK_ROOM_ID: ${{ secrets.CHATWORK_ROOM_ID_LABO_INV }}
         # シートは毎日更新。Chatwork投稿はスケジュール実行のうち月・水・金のみ。
         # 手動実行は send_chatwork=true の時だけ投稿（既定はシートのみ）。
