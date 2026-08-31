@@ -2,8 +2,9 @@
 """Inventory Pulse — 最小UI（Phase3 先行版）。
 
 GCS FUSE 上の在庫スナップショット Parquet を読み、
-①今日の在庫アラート ②全SKU一覧（シート同順・カンマ区切り）
-③在庫推移（行=SKU × 列=日付、時間軸は横）を表示する。
+①今日の在庫アラート ②フォーマットv2ビュー（在庫管理シートのライブ表示・
+シート同順・全列＋bot指標）③在庫推移（行=SKU × 列=日付、時間軸は横）を表示する。
+②はライブ読み取りが使えない環境ではスナップショット表にフォールバックする。
 
 設計方針:
   * 判断材料ファースト（policy_analysis_first_decision_tools）
@@ -214,6 +215,195 @@ def load() -> pd.DataFrame:
     return pd.concat([pd.read_parquet(p) for p in files], ignore_index=True)
 
 
+# ── ② フォーマットv2ビュー（在庫管理シートのライブ表示・読み取り専用）──────────
+# 列位置の正本は brands.py の format_cols＋inventory_snapshot.EXTRA_STOCK_COLS。
+# ここで列番号を再定義しない（二重管理は必ず片方が腐る）。
+# 表示名はスナップショット表と同じ語彙に寄せ、列ブロック色・警告閾値の定義を流用する。
+_SRC_SHEET = os.environ.get("SALES_SHEET_ID", "")
+
+_V2_LABEL = {
+    "product": "商品名", "size": "サイズ", "asin": "ASIN", "sku": "SKU",
+    "stock_total": "総在庫", "stock_fba": "FBA在庫", "stock_coco": "ココ在庫",
+    "micro_amazon": "マイクロアルジェAmazon在庫",
+    "micro_rakuten": "マイクロアルジェ楽天在庫",
+    "stock_own": "自社在庫", "requested_qty": "依頼済数量",
+    "sales_total": "シート販売数(総)", "sales_amazon": "シート販売数(Amazon)",
+    "sales_coco": "シート販売数(ココ)",
+    "days_total": "シート在庫日数(総)", "days_amazon": "シート在庫日数(Amazon)",
+    "days_coco": "シート在庫日数(ココ)",
+    "stockout_total": "シート在庫切れ(総)", "stockout_amazon": "シート在庫切れ(Amazon)",
+    "stockout_coco": "シート在庫切れ(ココ)",
+    "delivery_deadline": "在庫納品期限", "repeat_order_deadline": "リピート発注期限",
+    "alert_order": "発注アラート", "alert_fba": "FBA納品アラート",
+    "alert_coco": "ココ納品アラート", "alert_done": "対応済",
+    "lot_current": "現ロット", "lot_ordered": "発注済ロット",
+    "delivery_plan": "納品予定", "delivery_plan_qty": "納品予定数量",
+    "order_lot": "発注ロット数", "sku_comment": "SKU全体コメント",
+    # 出荷依頼のシート実ヘッダは「日付/…出荷依頼数/数量」の繰り返しで区別が
+    # つかないため、表示名でチャネルを明示する
+    "amazon_todo_date": "Amazon出荷依頼:日付", "amazon_todo": "Amazon出荷依頼:内容",
+    "amazon_todo_qty": "Amazon出荷依頼:数量",
+    "coco_todo_date": "ココ出荷依頼:日付", "coco_todo": "ココ出荷依頼:内容",
+    "coco_todo_qty": "ココ出荷依頼:数量",
+}
+# 数値変換しない役割（識別子・日付・アラート・手入力テキスト）。SKUはJAN型の
+# 数字列があるため数値化するとゼロ落ち・突合不能になる（識別子は文字列のまま）。
+_V2_TEXT_ROLES = {
+    "product", "size", "asin", "sku",
+    "stockout_total", "stockout_amazon", "stockout_coco",
+    "delivery_deadline", "repeat_order_deadline",
+    "alert_order", "alert_fba", "alert_coco", "alert_done",
+    "lot_current", "lot_ordered", "delivery_plan",
+    "new_lot_assign", "aerologi", "set_assembly", "order_consider",
+    "amazon_todo_date", "amazon_todo", "coco_todo_date", "coco_todo",
+    "sku_comment",
+}
+
+
+@st.cache_data(ttl=600)
+def _load_v2_live(brand_key: str) -> tuple[pd.DataFrame, list[str]]:
+    """在庫管理シートのフォーマットタブを生値で読む（読み取り専用・書き込みなし）。
+
+    戻り値 = (シート同順の全列DataFrame, ヘッダ検証の警告リスト)。
+    表示名は _V2_LABEL を優先し、無い役割は実シートのヘッダ文字列を使う
+    （エアロジ・ToDo列など、ラベルの正本はシート側）。
+    """
+    import brands as brands_mod
+    from inventory_alert import resolve_title
+    from inventory_snapshot import EXTRA_STOCK_COLS, _num, _token
+    from sales30d import _a1, sheet_read
+
+    brand = brands_mod.get_brand(brand_key)
+    token = _token()
+    title = resolve_title(token, _SRC_SHEET, brand.format_gid)
+    start = brand.format_data_start_row
+    hrow = start - 1
+    head_rows = sheet_read(token, _SRC_SHEET, _a1(title, f"A{hrow}:AZ{hrow}"))
+    head = [str(v).strip() for v in (head_rows[0] if head_rows else [])]
+    issues = brands_mod.verify_format_headers(head, brand)
+
+    cols = dict(brand.format_cols)
+    for k, v in EXTRA_STOCK_COLS.get(brand_key, {}).items():
+        cols.setdefault(k, v)
+    ordered = sorted(cols.items(), key=lambda kv: kv[1])   # シートの列順
+    names, used = [], set()
+    for role, idx in ordered:
+        nm = _V2_LABEL.get(role) or (head[idx] if idx < len(head) and head[idx]
+                                     else role)
+        if nm in used:   # 実ヘッダの重複（結合セル由来）は役割名で区別する
+            nm = f"{nm}[{role}]"
+        used.add(nm)
+        names.append(nm)
+
+    rows = sheet_read(token, _SRC_SHEET, _a1(title, f"A{start}:AZ"))
+    p_at, s_at = cols["product"], cols["sku"]
+
+    def cell(r, i):
+        v = r[i] if i < len(r) else ""
+        return v.strip() if isinstance(v, str) else v
+
+    recs = []
+    for r in rows:
+        if not (cell(r, p_at) and cell(r, s_at)):
+            continue
+        rec = []
+        for role, idx in ordered:
+            v = cell(r, idx)
+            rec.append(str(v) if role in _V2_TEXT_ROLES else _num(v))
+        recs.append(rec)
+    df = pd.DataFrame(recs, columns=names)
+    if "SKU" in df.columns:
+        df["SKU"] = df["SKU"].astype(str)
+    return df, issues
+
+
+def _apply_v2_alert_tint(sty, frame: pd.DataFrame):
+    """アラート列: 値あり=薄赤（要対応）。対応済列: 値あり=薄緑。"""
+    def _alert(v):
+        return (_bg("#ffd2d2", "font-weight:600")
+                if str(v).strip() not in ("", "nan") else "")
+    for col in ("発注アラート", "FBA納品アラート", "ココ納品アラート"):
+        if col in frame.columns:
+            sty = _cellmap(sty, _alert, [col])
+    if "対応済" in frame.columns:
+        sty = _cellmap(sty, lambda v: _bg("#d9f0dd") if str(v).strip() else "",
+                       ["対応済"])
+    return sty
+
+
+def _render_v2(today: pd.DataFrame, bkey: str) -> bool:
+    """フォーマットv2ビューを描画する。描画できたら True（呼び出し側の
+
+    フォールバック判定に使う）。ライブ読み取りは UI_BRAND 専用サービスのみ
+    （SALES_SHEET_ID はそのブランドの在庫管理シートを指すため、開発用の
+    全ブランド表示で他ブランドに使うと別シートを読んでしまう）。
+    """
+    if not (_SRC_SHEET and _UI_BRAND and bkey == _UI_BRAND):
+        if bkey == _UI_BRAND or not _UI_BRAND:
+            st.info("SALES_SHEET_ID / UI_BRAND が未設定のためライブ表示は無効です")
+        return False
+    try:
+        v2, issues = _load_v2_live(bkey)
+    except Exception as e:  # noqa: BLE001 — fail-loud: 理由を画面に出してから代替表示
+        st.error("在庫管理シートのライブ読み込みに失敗しました"
+                 f"（スナップショット表を表示します）: {type(e).__name__}: {e}")
+        return False
+    for issue in issues:
+        st.warning(f"列ズレの可能性: {issue}")
+    if v2.empty:
+        st.warning("フォーマットタブから1行も読めませんでした（列マップ/gidを確認）")
+        return False
+
+    # bot指標（最新スナップショット）を右端に連結。ライブ値とbot判定を1枚で見る
+    bot_cols = [c for c in ("bot優先度", "bot区分", "bot推奨アクション")
+                if c in today.columns]
+    if bot_cols and "SKU" in v2.columns:
+        bot = today[["SKU", *bot_cols]].copy()
+        bot["SKU"] = bot["SKU"].astype(str)
+        v2 = v2.merge(bot, on="SKU", how="left")
+
+    c1, c2 = st.columns([3, 1])
+    q = c1.text_input("絞り込み（商品名/サイズ/SKU/ASIN 部分一致）", "",
+                      key=f"v2q_{bkey}")
+    todo_only = c2.checkbox("要対応のみ", key=f"v2todo_{bkey}",
+                            help="発注/FBA納品/ココ納品アラートのいずれかが立っていて"
+                                 "対応済が空の行だけを表示")
+    view = v2
+    if q.strip():
+        mask = pd.Series(False, index=view.index)
+        for c in ("商品名", "サイズ", "SKU", "ASIN"):
+            if c in view.columns:
+                mask |= view[c].astype(str).str.contains(
+                    q.strip(), case=False, na=False, regex=False)
+        view = view[mask]
+    if todo_only:
+        acols = [c for c in ("発注アラート", "FBA納品アラート", "ココ納品アラート")
+                 if c in view.columns]
+        if acols:
+            flagged = pd.Series(False, index=view.index)
+            for c in acols:
+                flagged |= view[c].astype(str).str.strip().ne("")
+            if "対応済" in view.columns:
+                flagged &= view["対応済"].astype(str).str.strip().eq("")
+            view = view[flagged]
+
+    sty = _style_commas(view)
+    sty = _apply_product_bands(sty, view)
+    sty = _apply_days_alert(sty, view.columns)
+    sty = _apply_v2_alert_tint(sty, view)
+    if "bot優先度" in view.columns:
+        sty = _cellmap(sty, lambda v: _bg(_SEV_BG[str(v).strip()])
+                       if str(v).strip() in _SEV_BG else "", ["bot優先度"])
+    st.dataframe(sty, use_container_width=True, hide_index=True,
+                 column_config=_pin_cols(["商品名", "サイズ"]),
+                 height=min(700, 60 + 36 * max(1, len(view))))
+    st.caption(f"{len(view)} SKU 表示 ／ 在庫管理シートのライブ値（10分キャッシュ・"
+               "サイドバーの更新ボタンで即時再読込）＋右端にbot指標。"
+               "本画面からの書き込みはありません（手入力はシート側が正本）。"
+               "色: 🟦在庫 🟩販売 🟧在庫日数 ／ 薄赤=アラートあり・薄緑=対応済")
+    return True
+
+
 # ブランドタブ（担当が自ブランドだけを見られるよう完全分離）
 _BRAND_ORDER = ["labo", "nature", "qiera"]
 _BRAND_LABEL = {"labo": "💊 悩み解決ラボ", "nature": "🧴 ナチュレ（LUBEE）", "qiera": "✨ Qiera"}
@@ -232,7 +422,7 @@ _ALL_COLS = ["商品名", "サイズ", "ASIN", "SKU",
 
 
 def _render_brand(b: pd.DataFrame, bkey: str) -> None:
-    """1ブランド分の画面（サマリ→①アラート→②全SKU→③推移）。widget keyはブランド別。"""
+    """1ブランド分の画面（サマリ→①アラート→②v2ビュー→③推移）。widget keyはブランド別。"""
     dates = sorted(b["日付"].unique())
     latest = dates[-1]
     today = b[b["日付"] == latest]
@@ -262,8 +452,23 @@ def _render_brand(b: pd.DataFrame, bkey: str) -> None:
             use_container_width=True, hide_index=True,
             height=min(420, 60 + 36 * len(alerts)))
 
-    # ②全SKU一覧（今日・シートと同じ並び）
-    st.subheader("② 全SKU一覧（最新スナップショット・シートと同順）")
+    # ②フォーマットv2ビュー（在庫管理シートのライブ表示）。ライブが使えない
+    # 環境（SALES_SHEET_ID未設定・読み取り失敗・開発用全ブランド表示）では
+    # 従来のスナップショット表を出す。ライブ成功時もexpanderで併置する
+    # （snapshot列にしかないbot日販・在庫日数等の検証用）。
+    st.subheader("② フォーマットv2ビュー（在庫管理シートのライブ表示・シートと同順）")
+    live_ok = _render_v2(today, bkey)
+    if live_ok:
+        with st.expander("②b 全SKU一覧（最新スナップショット・bot指標の全列）"):
+            _render_snapshot_table(today, bkey)
+    else:
+        _render_snapshot_table(today, bkey)
+
+    _render_trend(b, bkey)
+
+
+def _render_snapshot_table(today: pd.DataFrame, bkey: str) -> None:
+    """全SKU一覧（最新スナップショット・シートと同順）。"""
     all_rows = today[[c for c in _ALL_COLS if c in today.columns]]
     q = st.text_input("絞り込み（商品名/サイズ/SKU/ASIN 部分一致）", "",
                       key=f"q_{bkey}")
@@ -288,7 +493,9 @@ def _render_brand(b: pd.DataFrame, bkey: str) -> None:
                "FBA/ココ在庫日数 赤<30日・橙<45日 ／ bot列は 2026-08-18 以降の"
                "スナップショットから全SKUに値が入ります（それ以前はフラグSKUのみ）")
 
-    # ③在庫推移（行=SKU × 列=日付）
+
+def _render_trend(b: pd.DataFrame, bkey: str) -> None:
+    """③在庫推移（行=SKU × 列=日付）。"""
     st.subheader("③ 在庫推移（列=日付・新しい日付が右）")
     metric = st.selectbox(
         "指標", ["FBA在庫", "総在庫", "ココ在庫", "シート在庫日数(総)",
@@ -323,6 +530,7 @@ if df.empty:
 # 日付は書き込み側（inventory_snapshot.py）が常に %Y-%m-%d で出すため辞書順=時系列。
 if st.sidebar.button("🔄 最新データに更新"):
     load.clear()
+    _load_v2_live.clear()
     st.rerun()
 
 # 会社別アプリ分離（2026-08-17 滝谷さん指示）: サードナレッジ/ナチュレ/ディアスリーは
