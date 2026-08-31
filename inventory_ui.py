@@ -21,6 +21,7 @@ GCS FUSE 上の在庫スナップショット Parquet を読み、
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -638,6 +639,326 @@ def _save_lt(edited: pd.DataFrame, original: pd.DataFrame) -> tuple[int, list[st
             raise RuntimeError(f"verify失敗: 行{rownum} {sku} のLTが '{got}'（期待 '{want}'）")
         print(f"[lt-edit] 行{rownum} {sku}: {old_n} → {new_n}")
     return len(changes), []
+
+
+# ── Phase4b(Step2): 📦発注レコード（1ロット=1レコードの発注イベント台帳）────────
+# 格納先は蓄積先スプシ（SNAPSHOT_SHEET_ID）の専用タブ。正本v2タブへは一切書かない
+# （botの読み取り元と正本が二重化する事故を構造的に避ける＝Step2の確定方針）。
+# ステータス語彙は v2 手入力列と同語彙の5段階（移行時に転記変換が要らない）。
+# 書き込みは LT編集と同型: fail-closed／楽観ロック（ID列再読）／変更セルのみ
+# batchUpdate／読み戻し verify／旧値は stdout（Cloud Run ログ）に記録。
+_ORDER_TAB = "📦発注レコード"
+_ORDER_MARK = "📦 Inventory Pulse 発注レコード"
+_ORDER_HEADERS = ["ID", "記録日時", "ブランド", "SKU", "商品名", "サイズ",
+                  "ロットNo", "数量", "発注日", "納品予定日", "ステータス",
+                  "コメント", "更新日時"]
+_ORDER_LAST_COL = "M"
+_ORDER_STATUS = ["発注済", "新ロット振り分け済", "エアロジ入荷登録済",
+                 "納品依頼済", "対応済"]
+_ORDER_DONE = "対応済"
+# UI から編集できる列（それ以外は入力時に確定）。列挿入したら要再採番。
+_ORDER_EDITABLE = {"数量": "H", "納品予定日": "J", "ステータス": "K", "コメント": "L"}
+_ORDER_TS_COL = "M"            # 更新日時（編集保存時に自動更新）
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _order_now() -> str:
+    from datetime import datetime
+    from inventory_alert import JST
+    return datetime.now(JST).strftime("%Y/%m/%d %H:%M JST")
+
+
+def _ensure_order_tab(token: str) -> None:
+    """タブが無ければ作成し、A1所有印＋ヘッダを検証する（人手タブ誤上書きガード）。"""
+    from inventory_alert import get_or_create_tab
+    from sales30d import _a1, sheet_read, sheet_update
+    get_or_create_tab(token, _MASTER_SHEET, _ORDER_TAB)
+    head = sheet_read(token, _MASTER_SHEET, _a1(_ORDER_TAB, f"A1:{_ORDER_LAST_COL}2"))
+    a1 = str(head[0][0]).strip() if head and head[0] else ""
+    if not a1:
+        sheet_update(
+            token, _MASTER_SHEET, _a1(_ORDER_TAB, f"A1:{_ORDER_LAST_COL}2"),
+            [[f"{_ORDER_MARK}（UIから入力・行の挿入/並べ替え/削除は禁止）"]
+             + [""] * (len(_ORDER_HEADERS) - 1), _ORDER_HEADERS])
+        return
+    if not a1.startswith(_ORDER_MARK):
+        raise RuntimeError(f"タブ '{_ORDER_TAB}' のA1が所有印で始まらない"
+                           "（人手タブの可能性）→書き込み中止")
+    hdr = [str(v).strip() for v in (head[1] if len(head) >= 2 else [])]
+    if hdr[:len(_ORDER_HEADERS)] != _ORDER_HEADERS:
+        raise RuntimeError(f"タブ '{_ORDER_TAB}' のヘッダが想定と不一致→書き込み中止"
+                           f"（実際: {hdr[:len(_ORDER_HEADERS)]}）")
+
+
+@st.cache_data(ttl=60)
+def _load_orders() -> pd.DataFrame:
+    from sales30d import _a1, sheet_read
+    from inventory_snapshot import _token
+    token = _token()
+    _ensure_order_tab(token)
+    rows = sheet_read(token, _MASTER_SHEET, _a1(_ORDER_TAB, f"A3:{_ORDER_LAST_COL}"))
+    recs = []
+    for i, r in enumerate(rows):
+        def cell(idx):
+            return str(r[idx]).strip() if idx < len(r) else ""
+        if not cell(0):
+            continue
+        rec = {"行": 3 + i}
+        rec.update({name: cell(j) for j, name in enumerate(_ORDER_HEADERS)})
+        recs.append(rec)
+    df = pd.DataFrame(recs)
+    if not df.empty:
+        df["数量"] = pd.to_numeric(df["数量"], errors="coerce")
+    return df
+
+
+def _append_order(brand: str, sku: str, product: str, size: str, lot: str,
+                  qty: int, order_date: str, eta: str, comment: str) -> int:
+    """新規発注を1行 append する。IDは既存最大+1。書込後に読み戻しverify。"""
+    import urllib.parse
+    from sales30d import _a1, _sheets_call, sheet_read
+    from inventory_snapshot import _token
+    token = _token()
+    _ensure_order_tab(token)
+    cur = sheet_read(token, _MASTER_SHEET, _a1(_ORDER_TAB, "A3:A"))
+    ids = [int(str(v[0]).strip()) for v in cur
+           if v and str(v[0]).strip().isdigit()]
+    new_id = (max(ids) + 1) if ids else 1
+    now = _order_now()
+    row = [new_id, now, brand, sku, product, size, lot, qty,
+           order_date, eta, _ORDER_STATUS[0], comment, now]
+    suffix = ("/values/"
+              + urllib.parse.quote(_a1(_ORDER_TAB, f"A2:{_ORDER_LAST_COL}"), safe="")
+              + ":append")
+    res = _sheets_call("POST", token, _MASTER_SHEET, suffix,
+                       params={"valueInputOption": "RAW",
+                               "insertDataOption": "INSERT_ROWS"},
+                       body={"values": [row]})
+    rng = res.get("updates", {}).get("updatedRange", "")
+    m = re.search(r"!A(\d+)", rng)
+    if not m:
+        raise RuntimeError(f"append結果のレンジが解釈できない: '{rng}'"
+                           "→タブを直接確認してください")
+    rownum = int(m.group(1))
+    back = sheet_read(token, _MASTER_SHEET,
+                      _a1(_ORDER_TAB, f"A{rownum}:D{rownum}"))
+    got_id = str(back[0][0]).strip() if back and back[0] else ""
+    got_sku = str(back[0][3]).strip() if back and back[0] and len(back[0]) > 3 else ""
+    if got_id != str(new_id) or got_sku != sku:
+        raise RuntimeError(f"verify失敗: 行{rownum} が ID'{got_id}'/SKU'{got_sku}'"
+                           f"（期待 '{new_id}'/'{sku}'）")
+    # ID重複ガード（Codex P2）: 同時送信で同じ max+1 を計算した場合、append自体は
+    # 両方成功してIDが重複する。全ID再読で重複を検知したら自行だけ再採番する。
+    all_ids = [int(str(v[0]).strip())
+               for v in sheet_read(token, _MASTER_SHEET, _a1(_ORDER_TAB, "A3:A"))
+               if v and str(v[0]).strip().isdigit()]
+    if all_ids.count(new_id) > 1:
+        fixed = max(all_ids) + 1
+        _sheets_call("POST", token, _MASTER_SHEET, "/values:batchUpdate",
+                     body={"valueInputOption": "RAW",
+                           "data": [{"range": _a1(_ORDER_TAB, f"A{rownum}"),
+                                     "values": [[fixed]]}]})
+        back2 = sheet_read(token, _MASTER_SHEET, _a1(_ORDER_TAB, f"A{rownum}"))
+        got2 = str(back2[0][0]).strip() if back2 and back2[0] else ""
+        if got2 != str(fixed):
+            raise RuntimeError(f"ID再採番のverify失敗: 行{rownum} が '{got2}'"
+                               f"（期待 '{fixed}'）")
+        print(f"[order-add] ID重複を検知し 行{rownum} を ID{new_id}→{fixed} に再採番")
+        new_id = fixed
+    print(f"[order-add] 行{rownum} ID{new_id} {sku} ロット'{lot}' {qty}個 "
+          f"発注{order_date} 納品予定{eta}")
+    return new_id
+
+
+def _save_orders(edited: pd.DataFrame, original: pd.DataFrame) -> tuple[int, list[str]]:
+    """変更された編集可能セルだけを書き戻す。(保存件数, エラーリスト) を返す。"""
+    from sales30d import _a1, _sheets_call, sheet_read
+    from inventory_snapshot import _token
+
+    def norm(col: str, v) -> str:
+        if col == "数量":
+            n = pd.to_numeric(v, errors="coerce")
+            return "" if pd.isna(n) else str(int(n))
+        return "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
+
+    changes = []   # (行, ID, 列レター, 列名, 旧, 新)
+    for idx in original.index:
+        for colname, letter in _ORDER_EDITABLE.items():
+            old_s = norm(colname, original.at[idx, colname])
+            new_s = norm(colname, edited.at[idx, colname])
+            if old_s == new_s:
+                continue
+            rid = str(original.at[idx, "ID"]).strip()
+            if colname == "数量" and (not new_s or int(new_s) <= 0):
+                return 0, [f"ID{rid}: 数量 '{new_s}' が不正（1以上の整数）"]
+            if colname == "納品予定日" and new_s and not _DATE_RE.match(new_s):
+                return 0, [f"ID{rid}: 納品予定日 '{new_s}' はYYYY-MM-DD形式で"]
+            if colname == "ステータス" and new_s not in _ORDER_STATUS:
+                return 0, [f"ID{rid}: ステータス '{new_s}' は不正"]
+            changes.append((int(original.at[idx, "行"]), rid, letter,
+                            colname, old_s, new_s))
+    if not changes:
+        return 0, []
+
+    token = _token()
+    # 楽観ロック: ID列（A列）を再読し、書込先の行に想定どおりのIDがいるか確認。
+    cur = sheet_read(token, _MASTER_SHEET, _a1(_ORDER_TAB, "A1:A"))
+    for rownum, rid, _, _, _, _ in changes:
+        got = (str(cur[rownum - 1][0]).strip()
+               if rownum - 1 < len(cur) and cur[rownum - 1] else "")
+        if got != rid:
+            return 0, [f"行{rownum} のIDが '{rid}' でなく '{got}'。"
+                       "タブ側で行が動いた可能性→画面を再読込してやり直してください"]
+
+    now = _order_now()
+    data = [{"range": _a1(_ORDER_TAB, f"{letter}{rownum}"), "values": [[new_s]]}
+            for rownum, _, letter, _, _, new_s in changes]
+    for rownum in sorted({c[0] for c in changes}):   # 変更行の更新日時
+        data.append({"range": _a1(_ORDER_TAB, f"{_ORDER_TS_COL}{rownum}"),
+                     "values": [[now]]})
+    res = _sheets_call("POST", token, _MASTER_SHEET, "/values:batchUpdate",
+                       body={"valueInputOption": "RAW", "data": data})
+    if res.get("totalUpdatedCells") != len(data):
+        raise RuntimeError(f"更新セル数が不一致（期待{len(data)}/"
+                           f"実際{res.get('totalUpdatedCells')}）。タブを直接確認してください")
+
+    for rownum, rid, letter, colname, old_s, new_s in changes:
+        back = sheet_read(token, _MASTER_SHEET, _a1(_ORDER_TAB, f"{letter}{rownum}"))
+        got = str(back[0][0]).strip() if back and back[0] else ""
+        if got != new_s:
+            raise RuntimeError(f"verify失敗: 行{rownum} ID{rid} {colname} が "
+                               f"'{got}'（期待 '{new_s}'）")
+        print(f"[order-edit] 行{rownum} ID{rid} {colname}: '{old_s}' → '{new_s}'")
+    return len(changes), []
+
+
+st.divider()
+st.subheader("📦 発注レコード（1ロット=1レコード・格納先は蓄積先スプシの専用タブ）")
+if _UI_BRAND not in ("", "labo"):
+    st.info("発注レコードはこの会社のSKUマスタ整備後に開放します")
+elif not _MASTER_SHEET:
+    st.info("SNAPSHOT_SHEET_ID が未設定のため、発注レコードはこの環境では無効です")
+else:
+    if st.session_state.get("order_saved_msg"):
+        st.success(st.session_state.pop("order_saved_msg"))
+    try:
+        orders_df = _load_orders()
+        order_master = _load_master()
+    except Exception as e:  # noqa: BLE001 — fail-closed: 読めないなら入力させない
+        st.error(f"発注レコードの読み込みに失敗: {type(e).__name__}: {e}")
+        st.stop()
+
+    # サマリ（未納=対応済以外。納品予定日超過=遅延）
+    today_str = pd.Timestamp.now(tz="Asia/Tokyo").strftime("%Y-%m-%d")
+    if orders_df.empty:
+        open_df = orders_df
+        n_late = 0
+    else:
+        open_df = orders_df[orders_df["ステータス"] != _ORDER_DONE]
+        _eta = open_df["納品予定日"].astype(str)
+        n_late = int((_eta.str.match(_DATE_RE.pattern) & (_eta < today_str)).sum())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("未納レコード", len(open_df))
+    c2.metric("🔴 納品予定日超過（遅延）", n_late)
+    c3.metric("未納合計数量", 0 if open_df.empty
+              else int(open_df["数量"].fillna(0).sum()))
+
+    with st.expander("➕ 新規発注を記録", expanded=orders_df.empty):
+        opts = {f"{r['SKU']} ― {r['商品名']} {r['サイズ']}": r
+                for _, r in order_master.iterrows()}
+        if not opts:
+            st.info("SKUマスタが空のため入力できません（🧩SKUマスタdraft を確認）")
+        else:
+            with st.form("order_add", clear_on_submit=True):
+                sel = st.selectbox("SKU（🧩SKUマスタdraft から選択）", list(opts))
+                f1, f2, f3, f4 = st.columns(4)
+                lot = f1.text_input("ロットNo（何ロット目）")
+                qty = f2.number_input("数量", min_value=1, step=1, value=1)
+                odate = f3.date_input("発注日", format="YYYY-MM-DD")
+                eta = f4.date_input("納品予定日", format="YYYY-MM-DD")
+                comment = st.text_input("コメント（任意）")
+                if st.form_submit_button("📦 発注を記録"):
+                    if eta < odate:
+                        st.error("納品予定日が発注日より前です")
+                    else:
+                        row = opts[sel]
+                        try:
+                            rid = _append_order(
+                                _UI_BRAND or "labo", str(row["SKU"]),
+                                str(row["商品名"]), str(row["サイズ"]), lot.strip(),
+                                int(qty), odate.strftime("%Y-%m-%d"),
+                                eta.strftime("%Y-%m-%d"), comment.strip())
+                        except Exception as e:  # noqa: BLE001 — 失敗を画面に明示
+                            st.error(f"記録に失敗: {type(e).__name__}: {e}")
+                            st.stop()
+                        st.session_state["order_saved_msg"] = \
+                            f"ID{rid} を記録しました（ステータス=発注済）"
+                        _load_orders.clear()
+                        st.rerun()
+
+    if orders_df.empty:
+        st.info("発注レコードはまだありません（上のフォームから記録できます）")
+    else:
+        # 未納→納品予定日昇順で表示（危ないものが上）。編集は4列のみ。
+        view = orders_df.copy()
+        view["遅延"] = ""
+        late_mask = ((view["ステータス"] != _ORDER_DONE)
+                     & view["納品予定日"].astype(str).str.match(_DATE_RE.pattern)
+                     & (view["納品予定日"].astype(str) < today_str))
+        view.loc[late_mask, "遅延"] = "🔴 遅延"
+        view = view.sort_values(
+            by=["ステータス", "納品予定日"],
+            key=lambda s: (s.map(lambda v: 1 if v == _ORDER_DONE else 0)
+                           if s.name == "ステータス" else s))
+        show_cols = ["遅延", "ID", "SKU", "商品名", "サイズ", "ロットNo", "数量",
+                     "発注日", "納品予定日", "ステータス", "コメント",
+                     "記録日時", "更新日時", "行"]
+        view = view[[c for c in show_cols if c in view.columns]]
+        _orev = st.session_state.get("order_rev", 0)
+        edited_orders = st.data_editor(
+            view, hide_index=True, key=f"order_editor_{_orev}", num_rows="fixed",
+            disabled=[c for c in view.columns if c not in _ORDER_EDITABLE],
+            column_config={
+                "行": None,
+                "数量": st.column_config.NumberColumn(min_value=1, step=1,
+                                                      format="%d"),
+                "ステータス": st.column_config.SelectboxColumn(
+                    options=_ORDER_STATUS, required=True),
+            },
+            height=min(560, 60 + 36 * max(1, len(view))))
+        st.caption(f"全{len(view)}件（未納→納品予定日順）。編集できるのは "
+                   "**数量・納品予定日(YYYY-MM-DD)・ステータス・コメント** の4列。"
+                   f"ステータスは {' → '.join(_ORDER_STATUS)} の5段階"
+                   "（対応済=完納で未納集計から外れる）。")
+        if st.button("💾 変更を保存", key="order_save"):
+            try:
+                n, errs = _save_orders(edited_orders, view)
+            except Exception as e:  # noqa: BLE001 — 部分書込の可能性も画面に明示
+                st.error(f"保存に失敗（部分的に書き込まれた可能性あり。"
+                         f"タブを直接確認してください）: {type(e).__name__}: {e}")
+                st.stop()
+            if errs:
+                st.error("保存を中止しました: " + " ／ ".join(errs))
+            elif n == 0:
+                st.info("変更はありません")
+            else:
+                st.session_state["order_saved_msg"] = f"{n} セルを保存しました"
+                _load_orders.clear()
+                st.session_state["order_rev"] = _orev + 1
+                st.rerun()
+
+        with st.expander("📊 SKU別 未納合計（依頼済数量の自動算出）"):
+            if open_df.empty:
+                st.info("未納レコードはありません")
+            else:
+                agg = (open_df.assign(数量=open_df["数量"].fillna(0))
+                       .groupby(["SKU", "商品名", "サイズ"], as_index=False)
+                       .agg(未納レコード=("ID", "count"), 未納合計数量=("数量", "sum")))
+                st.dataframe(_style_commas(agg), use_container_width=True,
+                             hide_index=True)
+                st.caption("未納 = ステータスが「対応済」以外のレコード。"
+                           "v2の手入力『依頼済数量』の代替となる自動算出値です"
+                           "（両者の突合はStep2運用開始後に実施）。")
 
 
 st.divider()
