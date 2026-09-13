@@ -10,7 +10,7 @@ SP-API refresh token）は環境変数で注入し、ここには置かない。
    悩み解決ラボはマイクロアルジェ仕入の在庫列が増えるためナチュレと列順が違う。
    （2026-06-26 ナチュレ検証済。2026-06-29 labo[フォーマットv2]/qiera[フォーマット]
      を実シート実地検証して追加。labo=マイクロアルジェ列(H,I)増設で自社以降がズレ、
-     qiera=ラベル列なしで sku_comment が AM。ココ7d/30d は labo=RSL売上状況/
+     qiera=ラベル列なしで sku_comment が AM→2026-09-10 の「納品入り数」挿入で AN。ココ7d/30d は labo=RSL売上状況/
      qiera=NE売上状況 タブ。両者とも列構造は同一[sku=D,7d=E,30d=F,データ3行目開始]。）
 """
 from __future__ import annotations
@@ -51,8 +51,11 @@ NATURE_FORMAT_COLS = {
     "new_lot_assign": 28, "aerologi": 29, "label": 30, "set_assembly": 31,
     "order_consider": 32,
     "amazon_todo_date": 33, "amazon_todo": 34, "amazon_todo_qty": 35,
-    "coco_todo_date": 36, "coco_todo": 37, "coco_todo_qty": 38,
-    "sku_comment": 39,
+    # 2026-09-10 担当者が AK「（納品入り数）」を Amazon 数量の直後に挿入（意図的・
+    # 2026-09-13 実シート再検証）。以降 +1。
+    "amazon_todo_pack": 36,
+    "coco_todo_date": 37, "coco_todo": 38, "coco_todo_qty": 39,
+    "sku_comment": 40,
 }
 # NE売上状況タブ（ココドット/NEチャネルの 7日・30日 販売数）の列マップ。
 # ※ Amazon ではない。Amazon の 7d/30d は SP-API から取得する。
@@ -94,8 +97,11 @@ QIERA_FORMAT_COLS = {
     "lot_current": 24, "lot_ordered": 25, "delivery_plan": 26, "order_lot": 27,
     "new_lot_assign": 28, "aerologi": 29, "set_assembly": 30, "order_consider": 31,
     "amazon_todo_date": 32, "amazon_todo": 33, "amazon_todo_qty": 34,
-    "coco_todo_date": 35, "coco_todo": 36, "coco_todo_qty": 37,
-    "sku_comment": 38,
+    # 2026-09-10 担当者が AJ「（納品入り数）」を Amazon 数量の直後に挿入（意図的・
+    # 2026-09-13 実シート再検証）。以降 +1。sku_comment は AN(39)。
+    "amazon_todo_pack": 35,
+    "coco_todo_date": 36, "coco_todo": 37, "coco_todo_qty": 38,
+    "sku_comment": 39,
 }
 # ココ7d/30d タブ（labo=RSL売上状況 / qiera=NE売上状況）。列構造はナチュレと同一。
 LABO_NE_COLS = {"sku": 3, "coco_7d": 4, "coco_30d": 5}
@@ -105,12 +111,25 @@ QIERA_NE_COLS = {"sku": 3, "coco_7d": 4, "coco_30d": 5}
 # 2026-08-17 に labo で AD「数量」列の挿入により order_lot 以降が+1ズレ、
 # sku_comment が「数量」列を読んで終売判定がサイレント停止していた事故の再発防止。
 # 位置ズレに気づきやすい後方の列を中心に張る。実ヘッダは 2026-08-17 実シート検証値。
+# 2026-09-10 nature/qiera に「（納品入り数）」列が挿入され sku_comment が+1（9/13 再検証・
+# 挿入列自体も検証点に追加して次の挿入/削除を即検知する）。
 NATURE_HEADER_EXPECT = {0: "商品名", 3: "SKU", 27: "発注ロット",
-                        31: "セット組み依頼", 39: "SKU全体コメント"}
+                        31: "セット組み依頼", 36: "入り数", 40: "SKU全体コメント"}
 LABO_HEADER_EXPECT = {0: "商品名", 3: "SKU", 30: "発注ロット",
                       33: "セット組み依頼", 41: "SKU全体コメント"}
 QIERA_HEADER_EXPECT = {0: "商品名", 3: "SKU", 27: "発注ロット",
-                       30: "セット組み依頼", 38: "SKU全体コメント"}
+                       30: "セット組み依頼", 35: "入り数", 39: "SKU全体コメント"}
+
+# OEM倉庫ロット表（在庫管理シート「商品_在庫状況」= labo は『マイクロアルジェ在庫』タブ）。
+# ロット×賞味期限×製造完了日。OEM側が更新主体のため Pulse は読み取り専用（賞味期限
+# タブ）。ヘッダは2行目・データは3行目から（2026-09-03 実シート検証値・0始まり）。
+LABO_LOT_COLS = {
+    "no": 1, "product": 2, "lot": 3, "asin": 4, "size": 5, "expiry": 6,
+    "per_box": 7, "boxes": 8, "qty": 9, "jan": 10, "status": 12,
+    "mfg_date": 13, "received": 14, "amazon_monthly": 15,
+}
+LABO_LOT_HEADER_EXPECT = {1: "No", 2: "商品", 4: "ASIN", 6: "賞味期限",
+                          9: "在庫", 13: "製造完了日"}
 
 
 def verify_format_headers(header_row: list, brand) -> list[str]:
@@ -167,6 +186,10 @@ class Brand:
     health_tabs: tuple = ()        # 健全性チェック対象タブ（未設定=スキップ）
     format_date_cell: str = ""     # フォーマットの基準日セル（例 "C2"。空=チェックなし）
     header_expect: dict = field(default_factory=dict)  # {列idx: ヘッダ含有文字列}（列ズレ検知）
+    lot_gid: int = 0               # OEMロット表タブ gid（0=未設定→賞味期限タブ無効）
+    lot_cols: dict = field(default_factory=dict)       # ロット表列マップ
+    lot_data_start_row: int = 3    # ロット表データ開始行（1始まり・ヘッダはその前行）
+    lot_header_expect: dict = field(default_factory=dict)
 
 
 # シートURLは実行時に SALES_SHEET_ID（secret）から組み立てる（IDをコードに残さない）。
@@ -204,6 +227,10 @@ BRANDS: dict[str, Brand] = {
         health_tabs=LABO_HEALTH_TABS,
         format_date_cell="C2",          # 更新日（在庫切れ予想日の起点）
         header_expect=LABO_HEADER_EXPECT,
+        lot_gid=1219762583,             # マイクロアルジェ在庫（＜商品_在庫状況＞）
+        lot_cols=LABO_LOT_COLS,
+        lot_data_start_row=3,
+        lot_header_expect=LABO_LOT_HEADER_EXPECT,
     ),
     "qiera": Brand(
         key="qiera",
