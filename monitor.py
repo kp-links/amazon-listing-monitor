@@ -62,10 +62,25 @@ JST = timezone(timedelta(hours=9))
 # 列I の値: TRUE=タグ推定 / RANK1=カテゴリ1位だがノード商品数<100でタグ対象外 / FALSE。
 # ノード商品数のキャッシュは別タブ NODE_TAB（自動作成・日次更新）。
 (COL_ASIN, COL_NAME, COL_SKU, COL_MUTE, COL_MEMO, COL_STATUS, COL_CHECK,
- COL_SELLERS, COL_BEST, COL_PARENT, COL_BROWSE) = range(11)
+ COL_SELLERS, COL_BEST, COL_PARENT, COL_BROWSE, COL_ISSUES) = range(12)
+NCOL = 12
 HEADER = ["ASIN", "商品名", "SKU", "アラート除外", "メモ",
           "最終ステータス(自動)", "最終チェック(自動)", "相乗りセラーID(自動)",
-          "ベストセラー(自動)", "バリエーション親(自動)", "ブラウズノード(自動)"]
+          "ベストセラー(自動)", "バリエーション親(自動)", "ブラウズノード(自動)",
+          "出品issue(自動)"]
+# 列L: 出品 issue のコード列（E=ERROR/W=WARNING、例 "E100238;W90225"）。新規出現時だけ通知（初回は baseline）。
+# Listings Items API の enforcements.actions → 日本語ラベル（出品停止理由の粒度）
+ENFORCEMENT_JA = {
+    "LISTING_SUPPRESSED": "出品停止(非表示)",
+    "SEARCH_SUPPRESSED": "検索非表示",
+    "ATTRIBUTE_SUPPRESSED": "属性のみ非表示",
+    "CATALOG_ITEM_REMOVED": "カタログ削除",
+}
+RESTRICTION_JA = {
+    "APPROVAL_REQUIRED": "出品に承認が必要（カテゴリ/ブランド制限）",
+    "ASIN_NOT_FOUND": "ASIN がカタログに存在しない",
+    "NOT_ELIGIBLE": "この ASIN は出品不可（資格なし）",
+}
 STOREFRONT = "https://www.amazon.co.jp/sp?seller={}"  # セラー名はSP-APIで取れずURLで代替
 
 # ベストセラータグ付与のノード商品数条件（親ASIN単位・Amazon非公開の経験則）。
@@ -190,17 +205,73 @@ def get_listings_item(token: str, seller: str, sku: str) -> dict | None:
             summ = next((s for s in summaries if s.get("marketplaceId") == mp),
                         summaries[0] if summaries else {})
             status = summ.get("status") or []
-            issues = d.get("issues") or []
-            errs = [f"{i.get('code', '')} {(i.get('message') or '').strip()[:90]}".strip()
-                    for i in issues if i.get("severity") == "ERROR"]
+            issues = []
+            for i in d.get("issues") or []:
+                acts = [a.get("action") for a in ((i.get("enforcements") or {}).get("actions") or [])
+                        if a.get("action")]
+                issues.append({"sev": str(i.get("severity") or ""), "code": str(i.get("code") or ""),
+                               "msg": (i.get("message") or "").strip(),
+                               "attrs": list(i.get("attributeNames") or []), "actions": acts})
+            # 措置が重いもの（出品停止/検索非表示/カタログ削除）→ ERROR → WARNING の順
+            rank = {"LISTING_SUPPRESSED": 0, "CATALOG_ITEM_REMOVED": 0, "SEARCH_SUPPRESSED": 1,
+                    "ATTRIBUTE_SUPPRESSED": 2}
+            issues.sort(key=lambda x: (min([rank.get(a, 3) for a in x["actions"]] or [3]),
+                                       0 if x["sev"] == "ERROR" else 1))
+            errs = [_issue_line(x) for x in issues if x["sev"] == "ERROR"]
             return {"searchable": "DISCOVERABLE" in status, "buyable": "BUYABLE" in status,
-                    "error": bool(errs), "status": list(status), "error_msgs": errs[:3]}
+                    "error": bool(errs), "status": list(status), "error_msgs": errs[:3],
+                    "issues": issues}
         if resp.status_code in (429, 503):
             time.sleep(2 * (2 ** attempt))
             continue
         if resp.status_code == 404:
-            return {"searchable": False, "buyable": False, "error": True,
-                    "status": [], "error_msgs": ["SKU が出品一覧に存在しない(404)"]}
+            return {"searchable": False, "buyable": False, "error": True, "status": [],
+                    "error_msgs": ["SKU が出品一覧に存在しない(404)＝出品が削除された"],
+                    "issues": [{"sev": "ERROR", "code": "404", "msg": "SKU が出品一覧に存在しない＝出品削除",
+                                "attrs": [], "actions": ["CATALOG_ITEM_REMOVED"]}]}
+        return None
+    return None
+
+
+def _issue_line(x: dict) -> str:
+    """出品 issue 1件 → 通知1行。例: [ERROR] 100238 画像PT04は…（属性: main_product_image_locator｜措置: 属性のみ非表示）"""
+    extra = []
+    if x.get("attrs"):
+        extra.append("属性: " + ",".join(x["attrs"][:3]))
+    if x.get("actions"):
+        extra.append("措置: " + "/".join(ENFORCEMENT_JA.get(a, a) for a in x["actions"]))
+    tail = f"（{'｜'.join(extra)}）" if extra else ""
+    return f"[{x.get('sev', '')}] {x.get('code', '')} {x.get('msg', '')[:110]}{tail}"
+
+
+def _issue_codes(li: dict | None) -> str:
+    """列L 用: 'E100238;W90225' 形式（ソート済・重複除去）。li None は空文字（呼び元で前回値保持）。"""
+    if not li:
+        return ""
+    codes = sorted({f"{x['sev'][:1]}{x['code']}" for x in li.get("issues") or [] if x.get("code")})
+    return ";".join(codes)
+
+
+def get_listing_restrictions(token: str, seller: str, asin: str) -> list | None:
+    """Listings Restrictions API: この ASIN を自社が出品できるか（承認必要/出品不可/ASIN無し）。
+    購入不可・出品消失の ASIN だけに呼ぶ（軽量・原因の切り分け用）。失敗 None、制限なし []。"""
+    host = _env("SPAPI_HOST")
+    mp = _env("SPAPI_MARKETPLACE_ID")
+    url = f"https://{host}/listings/2021-08-01/restrictions"
+    params = {"asin": asin, "sellerId": seller, "marketplaceIds": mp, "conditionType": "new_new"}
+    for attempt in range(3):
+        resp = requests.get(url, params=params, headers={"x-amz-access-token": token}, timeout=30)
+        if resp.status_code == 200:
+            out = []
+            for rs in resp.json().get("restrictions") or []:
+                for rz in rs.get("reasons") or []:
+                    code = str(rz.get("reasonCode") or "")
+                    out.append(f"{RESTRICTION_JA.get(code, code)}: {(rz.get('message') or '').strip()[:100]}")
+            return out
+        if resp.status_code in (429, 503):
+            time.sleep(2 * (2 ** attempt))
+            continue
+        print(f"  [warn] restrictions {asin}: HTTP {resp.status_code} {resp.text[:100]}")
         return None
     return None
 
@@ -277,12 +348,23 @@ def _threshold_line(thr: dict | None, own_p: float | None, own_pts: int) -> str:
             " → 価格以外（60日平均販売価格・出品状態）を確認")
 
 
-def get_fba_inventory(token: str) -> dict:
-    """FBA在庫サマリ → {ASIN: 出荷可能数}。失敗時は空（致命でない）。"""
+def get_fba_inventory(token: str) -> tuple:
+    """FBA在庫サマリ → ({ASIN: 出荷可能数}, {ASIN: 内訳dict})。失敗時は空（致命でない）。
+    内訳 = 入庫中(inbound)/予約済(reserved)/販売不可(unfulfillable)/調査中(researching)。在庫0の原因切り分け用。"""
     host = _env("SPAPI_HOST")
     mp = _env("SPAPI_MARKETPLACE_ID")
     url = f"https://{host}/fba/inventory/v1/summaries"
-    out, next_tok = {}, None
+    out, detail, next_tok = {}, {}, None
+
+    def _i(v, total_key: str | None = None):
+        """details=true では reserved/unfulfillable/researching が {total...: n} のネスト、
+        環境によっては整数で返る可能性もあるため両対応（Codex P1・2026-10-12 実測はネスト）。"""
+        if isinstance(v, dict):
+            v = v.get(total_key) if total_key else None
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
     for _ in range(60):
         params = {"granularityType": "Marketplace", "granularityId": mp, "marketplaceIds": mp, "details": "true"}
         if next_tok:
@@ -297,13 +379,14 @@ def get_fba_inventory(token: str) -> dict:
                 time.sleep(2 * (2 ** attempt))
                 continue
             print(f"  [warn] FBA在庫取得 HTTP {resp.status_code}")
-            return out
+            return out, detail
         if not ok:
-            return out
+            return out, detail
         body = resp.json()
         for s in (body.get("payload", {}) or {}).get("inventorySummaries", []):
             a = s.get("asin")
-            q = (s.get("inventoryDetails") or {}).get("fulfillableQuantity")
+            dd = s.get("inventoryDetails") or {}
+            q = dd.get("fulfillableQuantity")
             if q is None:
                 q = s.get("totalQuantity")
             try:
@@ -312,10 +395,28 @@ def get_fba_inventory(token: str) -> dict:
                 q = None
             if a:
                 out[a] = q
+                detail[a] = {
+                    "inbound": _i(dd.get("inboundWorkingQuantity")) + _i(dd.get("inboundShippedQuantity"))
+                               + _i(dd.get("inboundReceivingQuantity")),
+                    "reserved": _i(dd.get("reservedQuantity"), "totalReservedQuantity"),
+                    "unfulfillable": _i(dd.get("unfulfillableQuantity"), "totalUnfulfillableQuantity"),
+                    "researching": _i(dd.get("researchingQuantity"), "totalResearchingQuantity"),
+                }
         next_tok = (body.get("pagination") or {}).get("nextToken")
         if not next_tok:
             break
-    return out
+    return out, detail
+
+
+def _stock_zero_line(d: dict | None) -> str:
+    """在庫0の内訳行。入庫中があれば「納品待ち」、調査中/販売不可が主なら「FBA側の問題」と読める。"""
+    if not d:
+        return "  原因: 在庫切れ（FBA出荷可能0・内訳不明）"
+    hint = ("納品入庫待ち" if d["inbound"] > 0 else
+            "調査中/販売不可在庫のみ＝FBA側の処理待ち" if (d["researching"] or d["unfulfillable"]) else
+            "完全在庫切れ＝補充が必要")
+    return (f"  原因: 在庫切れ（FBA出荷可能0｜入庫中{d['inbound']}・予約済{d['reserved']}"
+            f"・販売不可{d['unfulfillable']}・調査中{d['researching']}）→ {hint}")
 
 
 def get_catalog_all(token: str, asins: list) -> dict:
@@ -900,7 +1001,7 @@ def main() -> int:
     gtok = sheets_service_token()
 
     # ヘッダを設定
-    sheet_update(gtok, sheet_id, "A1:K1", [HEADER])
+    sheet_update(gtok, sheet_id, "A1:L1", [HEADER])
 
     meta = load_meta(gtok, sheet_id)
 
@@ -921,10 +1022,10 @@ def main() -> int:
             print(f"  [warn] 新商品同期失敗（次サイクルで再試行）: {e}")
 
     # 1) シート読込（ヘッダ除く）＝監視対象の正本。新規ASINは日次自動追記または手動行追加。
-    rows = sheet_get(gtok, sheet_id, "A2:K")
+    rows = sheet_get(gtok, sheet_id, "A2:L")
 
     # 2) 各ASINを判定
-    inv = get_fba_inventory(token)   # {asin: 出荷可能数}（原因＝在庫切れ判定用）
+    inv, inv_detail = get_fba_inventory(token)   # {asin: 出荷可能数}, {asin: 内訳}（在庫切れ原因の切り分け）
     cat = get_catalog_all(token, [r[COL_ASIN].strip() for r in rows
                                   if r and len(r) > COL_ASIN and r[COL_ASIN].strip()])
 
@@ -957,19 +1058,21 @@ def main() -> int:
     cpt_pending = []     # [(problems index, asin, 自社価格, 自社pt)] Buy Box抑制のしきい値を後段で付与
     n_cart = n_search = n_hijack = n_best = n_var = n_browse = 0
     for r in rows:
-        r = (r + [""] * 11)[:11]
+        r = (r + [""] * NCOL)[:NCOL]
         asin = r[COL_ASIN].strip()
         if not asin:
             writes.append([r[COL_STATUS], r[COL_CHECK], r[COL_SELLERS], r[COL_BEST],
-                           r[COL_PARENT], r[COL_BROWSE]])
+                           r[COL_PARENT], r[COL_BROWSE], r[COL_ISSUES]])
             continue
         sku, name = r[COL_SKU].strip(), r[COL_NAME].strip()
         muted = str(r[COL_MUTE]).strip().upper() in ("TRUE", "1", "YES", "✓")
         prev_sellers = {s.strip() for s in str(r[COL_SELLERS]).split(",") if s.strip()}
         prev_best, prev_parent = r[COL_BEST].strip(), r[COL_PARENT].strip()
         prev_browse = r[COL_BROWSE].strip()
+        prev_issues = r[COL_ISSUES].strip()
         if muted:
-            writes.append([ST_MUTED, now, r[COL_SELLERS], r[COL_BEST], r[COL_PARENT], r[COL_BROWSE]])
+            writes.append([ST_MUTED, now, r[COL_SELLERS], r[COL_BEST], r[COL_PARENT], r[COL_BROWSE],
+                           r[COL_ISSUES]])
             continue
         # 出品状態（getListingsItem）は getItemOffers の成否に関係なく先に取る。
         # BUYABLE 欠落＝購入不可は、オファーAPIが落ちていても必ず検知・通知する。
@@ -979,13 +1082,20 @@ def main() -> int:
             if li is None:
                 print(f"  [warn] {sku}: getListingsItem失敗→出品状態判定スキップ")
         not_buyable = li is not None and not li.get("buyable")
+        li_issues = (li or {}).get("issues") or []
+        # 列L: issue コード列。取得失敗は前回値保持。新規コードの出現だけ通知（初回 prev 空は baseline）。
+        issues_str = _issue_codes(li) if li is not None else prev_issues
+        prev_codes = {c for c in prev_issues.split(";") if c}
+        new_codes = [c for c in issues_str.split(";") if c and c not in prev_codes] if (li and prev_issues) else []
+        new_err = [x for x in li_issues if x["sev"] == "ERROR" and f"E{x['code']}" in new_codes]
+        new_warn = [x for x in li_issues if x["sev"] == "WARNING" and f"W{x['code']}" in new_codes]
 
         payload = get_item_offers(token, asin)
         api_fail = payload is None
         if api_fail and not not_buyable:
             # 🔴 前回ステータスを据え置かない（「正常」のまま時刻だけ更新され見逃す事故の再発防止）
             writes.append([ST_API_FAIL, now, r[COL_SELLERS], r[COL_BEST],
-                           r[COL_PARENT], r[COL_BROWSE]])
+                           r[COL_PARENT], r[COL_BROWSE], issues_str])
             time.sleep(0.6)
             continue
         payload = payload or {}
@@ -1088,10 +1198,17 @@ def main() -> int:
 
         status_parts = list(issues) + (["相乗りあり"] if others else [])
         status_str = "／".join(status_parts) if status_parts else ST_OK
-        writes.append([status_str, now, ",".join(others), best_str, parents_now, browse_str])
+        writes.append([status_str, now, ",".join(others), best_str, parents_now, browse_str, issues_str])
 
         new_sellers = [s for s in others if s not in prev_sellers]
-        if not (issues or new_sellers or best_event or var_event or browse_event):
+        # 出品 issue の新規出現（変化時のみ）: ERROR=🟠「出品ERROR発生」（例: 画像抑制。販売継続中でも出す）
+        # WARNING=🟡「出品WARNING(予兆)」（措置付き＝放置で抑制に進むもの、または属性不備の警告）
+        issue_event = None
+        if new_err:
+            issue_event = "出品ERROR発生"
+        elif new_warn:
+            issue_event = "出品WARNING(予兆)"
+        if not (issues or new_sellers or best_event or var_event or browse_event or issue_event):
             time.sleep(0.6)
             continue
 
@@ -1102,15 +1219,35 @@ def main() -> int:
             sev = "🔻"
         elif best_sev:
             sev = best_sev
+        elif issue_event == "出品WARNING(予兆)" and not new_sellers:
+            sev = "🟡"
         else:
             sev = "🟠"
-        heads = list(issues) + [e for e in (best_event, var_event, browse_event) if e]
+        heads = list(issues) + [e for e in (best_event, var_event, browse_event, issue_event) if e]
         block = [f"{sev} {'／'.join(heads) if heads else '他社相乗り'}",
                  f"  {name}（{sku}）" if sku else f"  {name}"]
+        tail_lines = []   # 原因行の後ろに出す詳細（issue 全件・出品資格）
+        # 出品 issue の全件列挙（停止/購入不可/検索対象外/消失/新規発生のいずれかで出す。最大6件）
+        show_issues = bool({"自社出品消失", "購入不可", "検索対象外"} & set(issues)) or bool(issue_event)
+        if show_issues and li_issues:
+            mark = {f"E{x['code']}" for x in new_err} | {f"W{x['code']}" for x in new_warn}
+            for x in li_issues[:6]:
+                flag = "🆕" if f"{x['sev'][:1]}{x['code']}" in mark else "  "
+                tail_lines.append(f"  {flag}{_issue_line(x)}")
+            if len(li_issues) > 6:
+                tail_lines.append(f"    …他 {len(li_issues) - 6} 件（セラセン「出品情報の品質」で全件）")
+        # 出品資格（承認必要/出品不可/ASIN無し）: 購入不可・出品消失のときだけ照会
+        if {"自社出品消失", "購入不可"} & set(issues):
+            rest = get_listing_restrictions(token, own_seller, asin)
+            if rest:
+                for line in rest[:2]:
+                    tail_lines.append(f"  出品資格: {line}")
+            elif rest is not None:
+                tail_lines.append("  出品資格: 制限なし（カテゴリ承認/ブランド制限は原因ではない）")
         if "自社出品消失" in issues:
             li_status = "/".join((li or {}).get("status") or []) if li else ""
             if stock == 0:
-                block.append("  原因: 在庫切れ（FBA在庫0＝補充で復帰）")
+                block.append(_stock_zero_line(inv_detail.get(asin)))
             elif li and not li.get("buyable"):
                 pass   # 原因は直後の「購入不可」節に出る（重複表示を避ける）
             elif li and li.get("buyable") and isinstance(stock, int) and stock > 0:
@@ -1122,17 +1259,21 @@ def main() -> int:
                 block.append("  原因: 出品停止 or 在庫切れ（在庫不明）")
             if invalid_asin:
                 block.append("  ※Amazon が『無効なASIN』応答＝商品ページが非表示/販売停止になっている")
-            if li and li.get("error_msgs") and "購入不可" not in issues:
-                for msg in li["error_msgs"][:2]:
-                    block.append(f"  出品ERROR: {msg}")
         if "購入不可" in issues:
             st_txt = "/".join(li.get("status") or []) or "なし"
             block.append(f"  原因: 出品が購入不可（status={st_txt}・BUYABLE欠落）"
                          + (f"・在庫{stock}あり" if isinstance(stock, int) and stock > 0 else ""))
-            for m in (li.get("error_msgs") or [])[:2]:
-                block.append(f"  出品ERROR: {m}")
-            if not li.get("error_msgs"):
-                block.append("  出品ERRORなし＝価格の健全性/出品情報の品質をセラセンで確認")
+            heavy = [x for x in li_issues if set(x["actions"]) & {"LISTING_SUPPRESSED", "CATALOG_ITEM_REMOVED"}]
+            if heavy:
+                block.append(f"  → 出品停止の措置を伴う issue が {len(heavy)} 件（上の措置:出品停止 の行）。修正すれば自動復帰")
+            elif stock == 0:
+                block.append(_stock_zero_line(inv_detail.get(asin)))
+            elif not li_issues:
+                block.append("  → 出品 issue なし・在庫あり＝価格エラー(最低/最高価格の範囲外)か価格の健全性か"
+                             "アカウント健全性(規約違反/知財申告)。後者2つは API 非対応＝セラセンで確認")
+            else:
+                block.append("  → issue は属性/画像レベルのみ＝BUYABLE欠落の直接原因は別"
+                             "（価格エラー/価格の健全性/アカウント健全性をセラセンで確認）")
         if "カート喪失" in issues:
             if own_p is not None and bb_p is not None and own_p > bb_p:
                 block.append(f"  原因: 価格負け（自社¥{own_p:,.0f} > カート¥{bb_p:,.0f}）")
@@ -1144,8 +1285,17 @@ def main() -> int:
             else:
                 block.append("  原因: 競合がカート取得")
         if "検索対象外" in issues:
-            errnote = "出品ERRORあり" if (li and li.get("error")) else "出品状態/規約を要確認"
-            block.append(f"  原因: 検索から抑制の可能性（購入は可・{errnote}）")
+            srch = [x for x in li_issues if "SEARCH_SUPPRESSED" in x["actions"]]
+            if srch:
+                block.append(f"  原因: 検索非表示の措置付き issue {len(srch)} 件（上の措置:検索非表示 の行）。"
+                             "購入は可・該当属性を修正すれば検索に復帰")
+            elif li_issues:
+                block.append("  原因: 検索から抑制（購入は可）。措置なしの issue のみ＝属性不備の累積か"
+                             "カテゴリ/ブランド側の抑制。上の issue を優先修正")
+            else:
+                block.append("  原因: 検索から抑制（購入は可）。出品 issue なし＝ブラウズノード未設定/"
+                             "規約・ブランド側の抑制の可能性→セラセン「出品情報の品質」で確認")
+        block.extend(tail_lines)
         if var_event:
             block.append(f"  ※バリエーション: 親 {prev_parent} → {parents_now}（レビュー/順位の統合に影響）")
         if best_note:
@@ -1178,9 +1328,9 @@ def main() -> int:
         n_browse += 1 if browse_event else 0
         time.sleep(0.6)
 
-    # 3) 自動列をシートへ書き戻し（F:K＝状態/時刻/相乗りID/ベストセラー/バリ親/ブラウズ）
+    # 3) 自動列をシートへ書き戻し（F:L＝状態/時刻/相乗りID/ベストセラー/バリ親/ブラウズ/出品issue）
     if writes:
-        sheet_update(gtok, sheet_id, f"F2:K{1 + len(writes)}", writes)
+        sheet_update(gtok, sheet_id, f"F2:L{1 + len(writes)}", writes)
 
     # 3.5) Buy Box抑制ASINに「競争力のある価格」しきい値を付与（20件バッチ・該当ASINのみ）
     if cpt_pending:
@@ -1194,7 +1344,7 @@ def main() -> int:
                 + "\n".join("\n".join(b) for b in problems)
                 + "\n[hr]※セラー名はストアURLをクリックで確認。"
                   "カート落ち/購入不可/検索対象外は解消かミュート(管理シート「アラート除外」TRUE)まで毎回通知。"
-                  "ベストセラー/バリエーション/ブラウズノードは変化時のみ。"
+                  "ベストセラー/バリエーション/ブラウズノード/出品issue(ERROR発生・WARNING予兆)は変化時のみ。"
                   "ベストセラータグ=カテゴリ1位×ノード商品数100件以上の推定。[/info]")
         chatwork_post(body)
         print(f"[alert] cart={n_cart} search={n_search} hijack={n_hijack} "
