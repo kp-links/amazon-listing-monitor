@@ -4,7 +4,12 @@ GitHub Actions で15分毎にクラウド実行（PCオフでも動く）。SP-A
 各ASINの Buy Box 状態を取得し、以下を検知して新規発生(onset)時のみ Chatwork に通知する:
   - カート喪失      : 自社オファーはあるが Buy Box を取れていない
   - 自社出品消失/停止: 自社オファーがオファー一覧に存在しない（出品停止・カート出せず）
+                      ※getItemOffers が 404 または 400「invalid ASIN」を返す場合も同扱い
+                       （2026-10-12: 400 を一時失敗扱いにして「正常」を据え置いた結果、
+                        ピュアビタC 30/90日分の停止を約1〜2.5日見逃した事故の恒久対策）
+  - 購入不可        : getListingsItem の status に BUYABLE が無い（在庫有無に関わらず毎回通知）
   - 他社相乗り      : 自社以外のセラーがオファーに存在
+  getItemOffers が失敗した回は前回ステータスを引き継がず「判定不可(API失敗)」を表に出す。
 状態は制御スプレッドシート（ASIN/アラート除外/最終ステータス…）を読み書きして保持する。
 「アラート除外」=TRUE のASINは通知しない（ミュート）。
 カート喪失/自社出品消失は未解決の間、ミュートまで毎回(15分毎)通知し続ける。相乗りは新規セラー出現時のみ通知。
@@ -90,8 +95,12 @@ ST_MUTED = "ミュート中"
 BAD = {
     "カート喪失": "🔴 Buy Box を他社に奪われています（カート喪失）",
     "自社出品消失": "🔴 自社オファーが消えています（出品停止・カート出せず）",
+    "購入不可": "🔴 出品が購入不可状態です（BUYABLE欠落・商品ページから買えない）",
     "他社相乗り": "🟠 他社セラーが相乗りしています",
 }
+# 毎回(15分毎)通知し続ける重大ステータス（解消 or ミュートまで）
+CRITICAL = ("カート喪失", "自社出品消失", "購入不可")
+ST_API_FAIL = "判定不可(API失敗)"
 
 
 # 監視対象の会社（テナント）。argv[1] で指定。空＝従来の無印secrets（悩み解決ラボ互換）。
@@ -147,6 +156,12 @@ def get_item_offers(token: str, asin: str) -> dict | None:
             continue
         if resp.status_code == 404:
             return {"_notfound": True}
+        # 400 "invalid ASIN for marketplace" = Amazon 側で当該ASINの販売ページが無効化
+        # （出品停止/抑制）された時の応答。一時失敗ではなく「出品消失」として扱う。
+        # 🔴 2026-10-12 以前はここで None を返し、呼び元が前回ステータス「正常」を据え置いていた。
+        if resp.status_code == 400 and "invalid ASIN" in resp.text:
+            print(f"  [warn] {asin}: HTTP 400 invalid ASIN → 出品消失扱い")
+            return {"_notfound": True, "_invalid_asin": True}
         # その他は一旦Noneで握る（個別ASINの失敗で全体を止めない）
         print(f"  [warn] {asin}: HTTP {resp.status_code} {resp.text[:120]}")
         return None
@@ -176,13 +191,16 @@ def get_listings_item(token: str, seller: str, sku: str) -> dict | None:
                         summaries[0] if summaries else {})
             status = summ.get("status") or []
             issues = d.get("issues") or []
+            errs = [f"{i.get('code', '')} {(i.get('message') or '').strip()[:90]}".strip()
+                    for i in issues if i.get("severity") == "ERROR"]
             return {"searchable": "DISCOVERABLE" in status, "buyable": "BUYABLE" in status,
-                    "error": any(i.get("severity") == "ERROR" for i in issues)}
+                    "error": bool(errs), "status": list(status), "error_msgs": errs[:3]}
         if resp.status_code in (429, 503):
             time.sleep(2 * (2 ** attempt))
             continue
         if resp.status_code == 404:
-            return {"searchable": False, "buyable": False, "error": True}
+            return {"searchable": False, "buyable": False, "error": True,
+                    "status": [], "error_msgs": ["SKU が出品一覧に存在しない(404)"]}
         return None
     return None
 
@@ -880,12 +898,24 @@ def main() -> int:
         if muted:
             writes.append([ST_MUTED, now, r[COL_SELLERS], r[COL_BEST], r[COL_PARENT], r[COL_BROWSE]])
             continue
+        # 出品状態（getListingsItem）は getItemOffers の成否に関係なく先に取る。
+        # BUYABLE 欠落＝購入不可は、オファーAPIが落ちていても必ず検知・通知する。
+        li = None
+        if sku:
+            li = get_listings_item(token, own_seller, sku)
+            if li is None:
+                print(f"  [warn] {sku}: getListingsItem失敗→出品状態判定スキップ")
+        not_buyable = li is not None and not li.get("buyable")
+
         payload = get_item_offers(token, asin)
-        if payload is None:
-            writes.append([r[COL_STATUS] or "判定不可", now, r[COL_SELLERS], r[COL_BEST],
+        api_fail = payload is None
+        if api_fail and not not_buyable:
+            # 🔴 前回ステータスを据え置かない（「正常」のまま時刻だけ更新され見逃す事故の再発防止）
+            writes.append([ST_API_FAIL, now, r[COL_SELLERS], r[COL_BEST],
                            r[COL_PARENT], r[COL_BROWSE]])
             time.sleep(0.6)
             continue
+        payload = payload or {}
         offers = payload.get("Offers", []) or []
         own = [o for o in offers if o.get("SellerId") == own_seller]
         others = sorted({o.get("SellerId") for o in offers
@@ -896,20 +926,18 @@ def main() -> int:
         comp = [p for p in (_price(o) for o in offers if o.get("SellerId") != own_seller) if p is not None]
         comp_min = min(comp) if comp else None
         stock = inv.get(asin)
-        cart_st = classify(payload, own_seller)
+        # オファーAPI失敗時(購入不可だけは判明)はカート判定を保留し、購入不可のみ通知する
+        cart_st = "" if api_fail else classify(payload, own_seller)
+        invalid_asin = bool(payload.get("_invalid_asin"))
 
         # 検索対象外（購入可だが検索から抑制）= getListingsItem。
-        search_off, li = False, None
-        if sku:
-            li = get_listings_item(token, own_seller, sku)
-            if li is None:
-                print(f"  [warn] {sku}: getListingsItem失敗→検索対象外判定スキップ")
-            elif li.get("buyable") and not li.get("searchable"):
-                search_off = True
+        search_off = bool(li and li.get("buyable") and not li.get("searchable"))
 
         issues = []
-        if cart_st in ("カート喪失", "自社出品消失"):
+        if cart_st in CRITICAL:
             issues.append(cart_st)
+        if not_buyable:
+            issues.append("購入不可")
         if search_off:
             issues.append("検索対象外")
 
@@ -994,7 +1022,7 @@ def main() -> int:
             continue
 
         # 通知ブロック（ASIN単位）
-        if any(i in ("カート喪失", "自社出品消失") for i in issues):
+        if any(i in CRITICAL for i in issues):
             sev = "🔴"
         elif var_event or browse_event or best_sev == "🔻":
             sev = "🔻"
@@ -1012,6 +1040,16 @@ def main() -> int:
                 block.append(f"  原因: 出品停止/カート出せず（在庫{stock}あり＝出品状態を要確認）")
             else:
                 block.append("  原因: 出品停止 or 在庫切れ（在庫不明）")
+            if invalid_asin:
+                block.append("  ※Amazon が『無効なASIN』応答＝商品ページが非表示/販売停止の可能性")
+        if "購入不可" in issues:
+            st_txt = "/".join(li.get("status") or []) or "なし"
+            block.append(f"  原因: 出品が購入不可（status={st_txt}・BUYABLE欠落）"
+                         + (f"・在庫{stock}あり" if isinstance(stock, int) and stock > 0 else ""))
+            for m in (li.get("error_msgs") or [])[:2]:
+                block.append(f"  出品ERROR: {m}")
+            if not li.get("error_msgs"):
+                block.append("  出品ERRORなし＝価格の健全性/出品情報の品質をセラセンで確認")
         if "カート喪失" in issues:
             if own_p is not None and bb_p is not None and own_p > bb_p:
                 block.append(f"  原因: 価格負け（自社¥{own_p:,.0f} > カート¥{bb_p:,.0f}）")
@@ -1046,7 +1084,7 @@ def main() -> int:
         if others and len(others) > len(new_sellers):
             block.append(f"  （相乗り合計 {len(others)}社）")
         problems.append("\n".join(block))
-        n_cart += 1 if cart_st in ("カート喪失", "自社出品消失") else 0
+        n_cart += 1 if (cart_st in CRITICAL or not_buyable) else 0
         n_search += 1 if search_off else 0
         n_hijack += 1 if new_sellers else 0
         n_best += 1 if best_event else 0
@@ -1063,7 +1101,7 @@ def main() -> int:
         body = (f"[info][title]【緊急】Amazonカート/出品アラート {now}[/title]\n"
                 + "\n".join(problems)
                 + "\n[hr]※セラー名はストアURLをクリックで確認。"
-                  "カート落ち/検索対象外は解消かミュート(管理シート「アラート除外」TRUE)まで毎回通知。"
+                  "カート落ち/購入不可/検索対象外は解消かミュート(管理シート「アラート除外」TRUE)まで毎回通知。"
                   "ベストセラー/バリエーション/ブラウズノードは変化時のみ。"
                   "ベストセラータグ=カテゴリ1位×ノード商品数100件以上の推定。[/info]")
         chatwork_post(body)
