@@ -205,6 +205,78 @@ def get_listings_item(token: str, seller: str, sku: str) -> dict | None:
     return None
 
 
+_PRICING_CS_URI = "/products/pricing/2022-05-01/items/competitiveSummary"
+_CS_BATCH, _CS_INTERVAL_SEC = 20, 31   # 0.033 req/s（公式）＝30秒に1回。余裕を持って31秒
+
+
+def _amt(p: dict | None) -> float | None:
+    try:
+        return float((p or {}).get("amount"))
+    except (TypeError, ValueError):
+        return None
+
+
+def get_competitive_thresholds(token: str, asins: list) -> dict:
+    """getCompetitiveSummary（20件バッチ）で「競争力のある価格」(CompetitivePriceThreshold) 等を取得。
+    セラセン「価格の健全性」の失格しきい値そのもの（Amazon外の他小売の最安基準・小売名非開示）。
+    レート制限が厳しいため Buy Box抑制の ASIN だけに限定して呼ぶ。失敗した ASIN は結果に含めない。"""
+    host = _env("SPAPI_HOST")
+    mp = _env("SPAPI_MARKETPLACE_ID")
+    out: dict = {}
+    asins = list(dict.fromkeys(a for a in asins if a))
+    for i in range(0, len(asins), _CS_BATCH):
+        if i:
+            time.sleep(_CS_INTERVAL_SEC)
+        chunk = asins[i:i + _CS_BATCH]
+        body = {"requests": [{"asin": a, "marketplaceId": mp,
+                              "includedData": ["referencePrices", "featuredBuyingOptions"],
+                              "method": "GET", "uri": _PRICING_CS_URI} for a in chunk]}
+        try:
+            resp = None
+            for attempt in range(3):
+                resp = requests.post(f"https://{host}/batches{_PRICING_CS_URI}", json=body,
+                                     headers={"x-amz-access-token": token}, timeout=60)
+                if resp.status_code in (429, 503):
+                    time.sleep(_CS_INTERVAL_SEC * (attempt + 1))
+                    continue
+                break
+            if resp is None or resp.status_code != 200:
+                print(f"  [warn] competitiveSummary HTTP {getattr(resp, 'status_code', '-')}: "
+                      f"{getattr(resp, 'text', '')[:120]}")
+                continue
+            for r in resp.json().get("responses", []) or []:
+                b = r.get("body") or {}
+                a = b.get("asin")
+                if not a:
+                    continue
+                refs = {str(x.get("name") or ""): _amt(x.get("price")) for x in b.get("referencePrices") or []}
+                out[a] = {"cpt": refs.get("CompetitivePriceThreshold"),
+                          "competitive": refs.get("CompetitivePrice"), "was": refs.get("WasPrice")}
+        except Exception as e:  # しきい値は補足情報＝取れなくても通知本体は出す
+            print(f"  [warn] competitiveSummary 失敗: {e}")
+    return out
+
+
+def _threshold_line(thr: dict | None, own_p: float | None, own_pts: int) -> str:
+    """Buy Box抑制ASINの通知に付ける「しきい値」行。着地価格 = 価格 − ポイント（送料はFBA前提で0）。"""
+    if not thr or thr.get("cpt") is None:
+        return ("  しきい値: 「競争力のある価格」の設定なし（取得不能 or 未設定）"
+                "＝60日平均販売価格基準の抑制か出品状態の問題→セラセン「価格の健全性」を確認")
+    cpt = thr["cpt"]
+    if own_p is None:
+        return f"  しきい値: 競争力のある価格 ¥{cpt:,.0f}（自社価格は取得不能）"
+    landed = own_p - own_pts
+    over = landed - cpt
+    if over > 0:
+        # 必要pt%は「現在ptを含めた合計」で示す（Codex P2: 差分だけ出すと既にptがある時に過小になる）
+        need_pct = int(-(-(own_p - cpt) * 100 // own_p))   # ceil((価格−しきい値)/価格)
+        return (f"  しきい値: 競争力のある価格 ¥{cpt:,.0f} ／ 自社着地 ¥{landed:,.0f}"
+                f"（価格¥{own_p:,.0f}−{own_pts}pt）＝ ¥{over:,.0f} 超過"
+                f" → 価格¥{cpt:,.0f}以下 か ポイント合計{need_pct}%以上（現在{own_pts}pt）で復帰見込み")
+    return (f"  しきい値: 競争力のある価格 ¥{cpt:,.0f} ／ 自社着地 ¥{landed:,.0f} は範囲内"
+            " → 価格以外（60日平均販売価格・出品状態）を確認")
+
+
 def get_fba_inventory(token: str) -> dict:
     """FBA在庫サマリ → {ASIN: 出荷可能数}。失敗時は空（致命でない）。"""
     host = _env("SPAPI_HOST")
@@ -881,7 +953,8 @@ def main() -> int:
 
     now = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
     writes = []          # 各行の [F状態, G時刻, H相乗りID, Iベストセラー, Jバリ親, Kブラウズ]
-    problems = []        # 通知ブロック（ASIN単位）
+    problems = []        # 通知ブロック（ASIN単位・行リスト）
+    cpt_pending = []     # [(problems index, asin, 自社価格, 自社pt)] Buy Box抑制のしきい値を後段で付与
     n_cart = n_search = n_hijack = n_best = n_var = n_browse = 0
     for r in rows:
         r = (r + [""] * 11)[:11]
@@ -922,6 +995,7 @@ def main() -> int:
                          if o.get("SellerId") and o.get("SellerId") != own_seller})
         bb = next(iter(payload.get("Summary", {}).get("BuyBoxPrices") or []), {})
         own_p = _price(own[0]) if own else None
+        own_pts = int(((own[0].get("Points") or {}).get("PointsNumber") or 0)) if own else 0
         bb_p = _price(bb)
         comp = [p for p in (_price(o) for o in offers if o.get("SellerId") != own_seller) if p is not None]
         comp_min = min(comp) if comp else None
@@ -1034,14 +1108,23 @@ def main() -> int:
         block = [f"{sev} {'／'.join(heads) if heads else '他社相乗り'}",
                  f"  {name}（{sku}）" if sku else f"  {name}"]
         if "自社出品消失" in issues:
+            li_status = "/".join((li or {}).get("status") or []) if li else ""
             if stock == 0:
-                block.append("  原因: 在庫切れ（FBA在庫0）")
+                block.append("  原因: 在庫切れ（FBA在庫0＝補充で復帰）")
+            elif li and not li.get("buyable"):
+                pass   # 原因は直後の「購入不可」節に出る（重複表示を避ける）
+            elif li and li.get("buyable") and isinstance(stock, int) and stock > 0:
+                block.append(f"  原因: 出品は BUYABLE・在庫{stock}ありなのに商品ページにオファーが出ない"
+                             "＝ASIN無効化/商品ページ抑制の疑い（規約・画像・カテゴリ違反、または変更承認待ち）")
             elif isinstance(stock, int) and stock > 0:
                 block.append(f"  原因: 出品停止/カート出せず（在庫{stock}あり＝出品状態を要確認）")
             else:
                 block.append("  原因: 出品停止 or 在庫切れ（在庫不明）")
             if invalid_asin:
-                block.append("  ※Amazon が『無効なASIN』応答＝商品ページが非表示/販売停止の可能性")
+                block.append("  ※Amazon が『無効なASIN』応答＝商品ページが非表示/販売停止になっている")
+            if li and li.get("error_msgs") and "購入不可" not in issues:
+                for msg in li["error_msgs"][:2]:
+                    block.append(f"  出品ERROR: {msg}")
         if "購入不可" in issues:
             st_txt = "/".join(li.get("status") or []) or "なし"
             block.append(f"  原因: 出品が購入不可（status={st_txt}・BUYABLE欠落）"
@@ -1054,7 +1137,10 @@ def main() -> int:
             if own_p is not None and bb_p is not None and own_p > bb_p:
                 block.append(f"  原因: 価格負け（自社¥{own_p:,.0f} > カート¥{bb_p:,.0f}）")
             elif not others:
-                block.append("  原因: Buy Box抑制（高値等で誰もカート取得せず）")
+                block.append("  原因: Buy Box抑制（価格の健全性＝「競争力のある価格」超過が最有力。しきい値は下行）")
+                # しきい値（CompetitivePriceThreshold）はレート制限が厳しい(0.033req/s)ため
+                # ループ後に該当ASINだけ20件バッチで取得して追記する。
+                cpt_pending.append((len(problems), asin, own_p, own_pts))
             else:
                 block.append("  原因: 競合がカート取得")
         if "検索対象外" in issues:
@@ -1083,7 +1169,7 @@ def main() -> int:
             block.append(f"  ↳ 新規相乗りセラー {sid}\n    ストア: {STOREFRONT.format(sid)}")
         if others and len(others) > len(new_sellers):
             block.append(f"  （相乗り合計 {len(others)}社）")
-        problems.append("\n".join(block))
+        problems.append(block)
         n_cart += 1 if (cart_st in CRITICAL or not_buyable) else 0
         n_search += 1 if search_off else 0
         n_hijack += 1 if new_sellers else 0
@@ -1096,10 +1182,16 @@ def main() -> int:
     if writes:
         sheet_update(gtok, sheet_id, f"F2:K{1 + len(writes)}", writes)
 
+    # 3.5) Buy Box抑制ASINに「競争力のある価格」しきい値を付与（20件バッチ・該当ASINのみ）
+    if cpt_pending:
+        thr = get_competitive_thresholds(token, [a for _, a, _, _ in cpt_pending])
+        for idx, a, p, pts in cpt_pending:
+            problems[idx].append(_threshold_line(thr.get(a), p, pts))
+
     # 4) Chatwork へ集約通知
     if problems:
         body = (f"[info][title]【緊急】Amazonカート/出品アラート {now}[/title]\n"
-                + "\n".join(problems)
+                + "\n".join("\n".join(b) for b in problems)
                 + "\n[hr]※セラー名はストアURLをクリックで確認。"
                   "カート落ち/購入不可/検索対象外は解消かミュート(管理シート「アラート除外」TRUE)まで毎回通知。"
                   "ベストセラー/バリエーション/ブラウズノードは変化時のみ。"
