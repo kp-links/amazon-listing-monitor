@@ -62,13 +62,22 @@ JST = timezone(timedelta(hours=9))
 # 列I の値: TRUE=タグ推定 / RANK1=カテゴリ1位だがノード商品数<100でタグ対象外 / FALSE。
 # ノード商品数のキャッシュは別タブ NODE_TAB（自動作成・日次更新）。
 (COL_ASIN, COL_NAME, COL_SKU, COL_MUTE, COL_MEMO, COL_STATUS, COL_CHECK,
- COL_SELLERS, COL_BEST, COL_PARENT, COL_BROWSE, COL_ISSUES) = range(12)
-NCOL = 12
+ COL_SELLERS, COL_BEST, COL_PARENT, COL_BROWSE, COL_ISSUES, COL_CPT, COL_CPT_NOTIFY) = range(14)
+NCOL = 14
 HEADER = ["ASIN", "商品名", "SKU", "アラート除外", "メモ",
           "最終ステータス(自動)", "最終チェック(自動)", "相乗りセラーID(自動)",
           "ベストセラー(自動)", "バリエーション親(自動)", "ブラウズノード(自動)",
-          "出品issue(自動)"]
+          "出品issue(自動)", "しきい値(自動)", "しきい値超過通知(自動)"]
+LAST_COL = "N"   # 自動列の末尾（範囲指定 A1:N1 / A2:N / F2:N に使用）
 # 列L: 出品 issue のコード列（E=ERROR/W=WARNING、例 "E100238;W90225"）。新規出現時だけ通知（初回は baseline）。
+# 列M: 「競争力のある価格」(CompetitivePriceThreshold) の日次キャッシュ（円・無ければ空）。
+#      全ASIN走査は 1日1回（レート 0.033req/s のため）、列M がある ASIN だけ毎サイクル再照会。
+# 列N: しきい値超過（非プライム層カート喪失 / カート落ちの疑い）を最後に通知した時刻。
+#      超過が続く間は CPT_NOTIFY_INTERVAL_SEC 毎に再通知、解消時に ✅ を1回出して空に戻す。
+CPT_NOTIFY_INTERVAL_SEC = 3 * 3600   # 2026-10-13 滝谷さん指示「②の検知は3時間に1回の通知」
+ST_CPT_PARTIAL = "カート喪失(非プライム層)"    # プライム限定セール中: プライムはセール価格でカート有、
+                                               # 非プライム(ログイン済み通常会員)は通常価格がしきい値超過で非表示
+ST_CPT_SUSPECT = "しきい値超過(カート落ち疑い)"  # セール無しで着地>しきい値なのにオファーAPIは獲得中＝反映遅れの疑い
 # Listings Items API の enforcements.actions → 日本語ラベル（出品停止理由の粒度）
 ENFORCEMENT_JA = {
     "LISTING_SUPPRESSED": "出品停止(非表示)",
@@ -309,10 +318,17 @@ def _amt(p: dict | None) -> float | None:
         return None
 
 
-def get_competitive_thresholds(token: str, asins: list) -> dict:
+def get_competitive_thresholds(token: str, asins: list, own_seller: str = "") -> dict:
     """getCompetitiveSummary（20件バッチ）で「競争力のある価格」(CompetitivePriceThreshold) 等を取得。
     セラセン「価格の健全性」の失格しきい値そのもの（Amazon外の他小売の最安基準・小売名非開示）。
-    レート制限が厳しいため Buy Box抑制の ASIN だけに限定して呼ぶ。失敗した ASIN は結果に含めない。"""
+    レート制限が厳しいため 列M キャッシュのある ASIN＋Buy Box抑制の ASIN に限定して呼ぶ（全件は日次）。
+    失敗した ASIN は結果に含めない（呼び元は前回値保持）。
+
+    own_seller 指定時は自社の表示オファー（featuredBuyingOptions）も返す:
+      segments=カートが表示されている閲覧セグメント（PRIME/NON_PRIME/DEFAULT・自社オファー分）
+      deal=DEAL プロモの割引後価格（プライム限定セール等。無ければ None）
+    🔴 セグメントに NON_PRIME が無い＝ログイン済み通常会員にはカートが出ていない（2026-10-13 Qiera NA美容液で実測）。
+    """
     host = _env("SPAPI_HOST")
     mp = _env("SPAPI_MARKETPLACE_ID")
     out: dict = {}
@@ -343,8 +359,27 @@ def get_competitive_thresholds(token: str, asins: list) -> dict:
                 if not a:
                     continue
                 refs = {str(x.get("name") or ""): _amt(x.get("price")) for x in b.get("referencePrices") or []}
-                out[a] = {"cpt": refs.get("CompetitivePriceThreshold"),
-                          "competitive": refs.get("CompetitivePrice"), "was": refs.get("WasPrice")}
+                ent = {"cpt": refs.get("CompetitivePriceThreshold"),
+                       "competitive": refs.get("CompetitivePrice"), "was": refs.get("WasPrice"),
+                       "segments": [], "deal": None, "fo_price": None, "fo_pts": 0}
+                if own_seller:
+                    for fbo in b.get("featuredBuyingOptions") or []:
+                        for seg in fbo.get("segmentedFeaturedOffers") or []:
+                            if seg.get("sellerId") != own_seller:
+                                continue
+                            for s in seg.get("featuredOfferSegments") or []:
+                                m = str(s.get("customerMembership") or "").strip()
+                                if m and m not in ent["segments"]:
+                                    ent["segments"].append(m)
+                            if ent["fo_price"] is None:
+                                ent["fo_price"] = _amt(seg.get("listingPrice"))
+                                ent["fo_pts"] = int((seg.get("points") or {}).get("pointsNumber") or 0)
+                            for pr in seg.get("promotions") or []:
+                                if str(pr.get("promotionType") or "").upper() == "DEAL":
+                                    d = _amt((pr.get("promotionSavings") or {}).get("discountedPrice"))
+                                    if d is not None and (ent["deal"] is None or d < ent["deal"]):
+                                        ent["deal"] = d
+                out[a] = ent
         except Exception as e:  # しきい値は補足情報＝取れなくても通知本体は出す
             print(f"  [warn] competitiveSummary 失敗: {e}")
     return out
@@ -1023,7 +1058,7 @@ def main() -> int:
     gtok = sheets_service_token()
 
     # ヘッダを設定
-    sheet_update(gtok, sheet_id, "A1:L1", [HEADER])
+    sheet_update(gtok, sheet_id, f"A1:{LAST_COL}1", [HEADER])
 
     meta = load_meta(gtok, sheet_id)
 
@@ -1044,7 +1079,34 @@ def main() -> int:
             print(f"  [warn] 新商品同期失敗（次サイクルで再試行）: {e}")
 
     # 1) シート読込（ヘッダ除く）＝監視対象の正本。新規ASINは日次自動追記または手動行追加。
-    rows = sheet_get(gtok, sheet_id, "A2:L")
+    rows = sheet_get(gtok, sheet_id, f"A2:{LAST_COL}")
+
+    # 1.5) 「競争力のある価格」しきい値（getCompetitiveSummary・0.033req/s）。
+    #    日次1回は全ASIN走査して列Mにキャッシュ、毎サイクルは列Mのある ASIN だけ再照会（通常は数件＝1バッチ）。
+    #    着地価格(価格−pt) > しきい値 なら、オファーAPIが「獲得中」と返していても通知する
+    #    （プライム限定セール中の非プライム層カート落ち / API反映遅れ。2026-10-13 Qiera NA美容液の見逃しが契機）。
+    cs: dict = {}
+    cpt_scan_due = meta.get("cpt_scan_last_date") != today
+    cs_targets = []
+    for r in rows:
+        r = (r + [""] * NCOL)[:NCOL]
+        a = r[COL_ASIN].strip()
+        if not a or str(r[COL_MUTE]).strip().upper() in ("TRUE", "1", "YES", "✓"):
+            continue
+        if cpt_scan_due or r[COL_CPT].strip():
+            cs_targets.append(a)
+    if cs_targets:
+        try:
+            cs = get_competitive_thresholds(token, cs_targets, own_seller)
+            print(f"  [cpt] 照会{len(cs_targets)}件（日次全走査={cpt_scan_due}）→ 応答{len(cs)}件・"
+                  f"しきい値あり{sum(1 for v in cs.values() if v.get('cpt') is not None)}件")
+            # 全走査が「概ね」取れた時だけ実施日を更新（半分以上欠けたら当日中に再試行）
+            if cpt_scan_due and len(cs) * 2 >= len(cs_targets):
+                meta["cpt_scan_last_date"] = today
+                save_meta(gtok, sheet_id, meta)
+        except Exception as e:   # しきい値は補助判定＝取れなくても本体の監視は続ける（前回値保持）
+            print(f"  [warn] しきい値照会失敗（列M は前回値保持）: {e}")
+            cs = {}
 
     # 2) 各ASINを判定
     inv, inv_detail = get_fba_inventory(token)   # {asin: 出荷可能数}, {asin: 内訳}（在庫切れ原因の切り分け）
@@ -1075,16 +1137,17 @@ def main() -> int:
         save_node_sizes(gtok, sheet_id, node_sizes)
 
     now = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
-    writes = []          # 各行の [F状態, G時刻, H相乗りID, Iベストセラー, Jバリ親, Kブラウズ]
+    writes = []          # 各行の [F状態, G時刻, H相乗りID, Iベストセラー, Jバリ親, Kブラウズ, L issue, Mしきい値, N超過通知]
     problems = []        # 通知ブロック（ASIN単位・行リスト）
     cpt_pending = []     # [(problems index, asin, 自社価格, 自社pt)] Buy Box抑制のしきい値を後段で付与
-    n_cart = n_search = n_hijack = n_best = n_var = n_browse = 0
+    n_cart = n_search = n_hijack = n_best = n_var = n_browse = n_cpt = 0
+    row_of: dict = {}    # asin → writes のインデックス（シート行 = 2 + idx）
     for r in rows:
         r = (r + [""] * NCOL)[:NCOL]
         asin = r[COL_ASIN].strip()
         if not asin:
             writes.append([r[COL_STATUS], r[COL_CHECK], r[COL_SELLERS], r[COL_BEST],
-                           r[COL_PARENT], r[COL_BROWSE], r[COL_ISSUES]])
+                           r[COL_PARENT], r[COL_BROWSE], r[COL_ISSUES], r[COL_CPT], r[COL_CPT_NOTIFY]])
             continue
         sku, name = r[COL_SKU].strip(), r[COL_NAME].strip()
         muted = str(r[COL_MUTE]).strip().upper() in ("TRUE", "1", "YES", "✓")
@@ -1092,9 +1155,13 @@ def main() -> int:
         prev_best, prev_parent = r[COL_BEST].strip(), r[COL_PARENT].strip()
         prev_browse = r[COL_BROWSE].strip()
         prev_issues = r[COL_ISSUES].strip()
+        prev_cpt, prev_cpt_notify = r[COL_CPT].strip(), r[COL_CPT_NOTIFY].strip()
+        # 列M: 今サイクルの照会結果で更新（照会対象外/失敗は前回値保持）。cpt 無し応答は空に戻す。
+        cse = cs.get(asin)
+        cpt_str = prev_cpt if cse is None else (f"{cse['cpt']:.0f}" if cse.get("cpt") is not None else "")
         if muted:
             writes.append([ST_MUTED, now, r[COL_SELLERS], r[COL_BEST], r[COL_PARENT], r[COL_BROWSE],
-                           r[COL_ISSUES]])
+                           r[COL_ISSUES], cpt_str, prev_cpt_notify])
             continue
         # 出品状態（getListingsItem）は getItemOffers の成否に関係なく先に取る。
         # BUYABLE 欠落＝購入不可は、オファーAPIが落ちていても必ず検知・通知する。
@@ -1117,7 +1184,7 @@ def main() -> int:
         if api_fail and not not_buyable:
             # 🔴 前回ステータスを据え置かない（「正常」のまま時刻だけ更新され見逃す事故の再発防止）
             writes.append([ST_API_FAIL, now, r[COL_SELLERS], r[COL_BEST],
-                           r[COL_PARENT], r[COL_BROWSE], issues_str])
+                           r[COL_PARENT], r[COL_BROWSE], issues_str, cpt_str, prev_cpt_notify])
             time.sleep(0.6)
             continue
         payload = payload or {}
@@ -1146,6 +1213,56 @@ def main() -> int:
             issues.append("購入不可")
         if search_off:
             issues.append("検索対象外")
+
+        # しきい値超過（オファーAPIは「自社がカート獲得中」なのに 通常価格の着地 > 競争力のある価格）。
+        #  - DEAL あり → プライム限定セール中。プライムはセール価格でカート有、非プライムには通常価格が出て非表示
+        #  - DEAL なし → 全員カート落ちの可能性（API 反映遅れ）。IsBuyBoxWinner=False に転じれば既存「カート喪失」が毎回通知
+        # 通知は CPT_NOTIFY_INTERVAL_SEC（3h）毎、解消時に ✅ を1回。列N に最終通知時刻を保持。
+        # 既存 CRITICAL（全員カート喪失/出品消失/購入不可）が立っている時はそちらが毎回通知するので本判定は休止し列Nを空に戻す。
+        cpt_event = cpt_resolved = None
+        cpt_notify_str = prev_cpt_notify
+        cpt_val = None
+        try:
+            cpt_val = float(cpt_str) if cpt_str else None
+        except ValueError:
+            cpt_val = None
+        if cart_st in CRITICAL or not_buyable:
+            cpt_notify_str = ""
+        elif (cart_st == ST_OK and cse is not None and cpt_val is not None
+              and own_p is not None and (own_p - own_pts) > cpt_val):
+            # 通常価格の着地が超過。DEAL（セール価格）の有無とセグメントで切り分け:
+            #   DEAL無し → 全員落ちの疑い(API反映遅れ)
+            #   DEALあり・セール着地も超過 → 全員落ちの疑い
+            #   DEALあり・NON_PRIME にもカート表示あり → 公開セール＝全員セール価格で通過（通知しない。Codex P2）
+            #   DEALあり・NON_PRIME 無し → プライム限定セール＝非プライム層だけ落ち
+            deal = cse.get("deal")
+            segs_now = cse.get("segments") or []
+            if deal is None or (deal - own_pts) > cpt_val:
+                cpt_state = ST_CPT_SUSPECT
+            elif "NON_PRIME" in segs_now:
+                cpt_state = None
+            else:
+                cpt_state = ST_CPT_PARTIAL
+            if cpt_state is None:
+                if prev_cpt_notify:
+                    cpt_resolved = True
+                    cpt_notify_str = ""
+            else:
+                issues.append(cpt_state)
+            due = cpt_state is not None
+            if due and prev_cpt_notify:
+                try:
+                    last = datetime.strptime(prev_cpt_notify, "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+                    due = (now_dt - last).total_seconds() >= CPT_NOTIFY_INTERVAL_SEC
+                except ValueError:
+                    due = True
+            if due:
+                cpt_event = cpt_state
+                cpt_notify_str = now
+        elif prev_cpt_notify and cse is not None and cart_st == ST_OK:
+            # 前回まで超過通知していて、今サイクルの照会で範囲内に戻った（or しきい値が消えた）＝解消を1回通知
+            cpt_resolved = True
+            cpt_notify_str = ""
 
         # ベストセラー / バリエーション / ブラウズノード（Catalog）。
         # 初回(prev空)はbaseline記録のみ＝通知しない。
@@ -1220,7 +1337,9 @@ def main() -> int:
 
         status_parts = list(issues) + (["相乗りあり"] if others else [])
         status_str = "／".join(status_parts) if status_parts else ST_OK
-        writes.append([status_str, now, ",".join(others), best_str, parents_now, browse_str, issues_str])
+        row_of[asin] = len(writes)   # 後段(3.5)でフォールバック取得したしきい値を列Mへ個別保存するための行位置
+        writes.append([status_str, now, ",".join(others), best_str, parents_now, browse_str, issues_str,
+                       cpt_str, cpt_notify_str])
 
         new_sellers = [s for s in others if s not in prev_sellers]
         # 出品 issue の新規出現（変化時のみ）: ERROR=🟠「出品ERROR発生」（例: 画像抑制。販売継続中でも出す）
@@ -1230,7 +1349,10 @@ def main() -> int:
             issue_event = "出品ERROR発生"
         elif new_warn:
             issue_event = "出品WARNING(予兆)"
-        if not (issues or new_sellers or best_event or var_event or browse_event or issue_event):
+        # しきい値超過は3時間毎（issues に入っていても通知期限前なら、それ単独では通知しない）
+        notify_issues = [i for i in issues if i not in (ST_CPT_PARTIAL, ST_CPT_SUSPECT) or cpt_event]
+        if not (notify_issues or new_sellers or best_event or var_event or browse_event or issue_event
+                or cpt_resolved):
             time.sleep(0.6)
             continue
 
@@ -1241,13 +1363,34 @@ def main() -> int:
             sev = "🔻"
         elif best_sev:
             sev = best_sev
+        elif cpt_resolved and not (notify_issues or new_sellers or issue_event):
+            sev = "✅"
         elif issue_event == "出品WARNING(予兆)" and not new_sellers:
             sev = "🟡"
         else:
             sev = "🟠"
-        heads = list(issues) + [e for e in (best_event, var_event, browse_event, issue_event) if e]
+        heads = list(notify_issues) + [e for e in (best_event, var_event, browse_event, issue_event) if e]
+        if cpt_resolved:
+            heads.append("しきい値超過 解消")
         block = [f"{sev} {'／'.join(heads) if heads else '他社相乗り'}",
                  f"  {name}（{sku}）" if sku else f"  {name}"]
+        if cpt_event:
+            deal = cse.get("deal")
+            segs = "/".join(cse.get("segments") or []) or "取得なし"
+            if cpt_event == ST_CPT_PARTIAL:
+                block.append(f"  原因: プライム限定セール中（セール価格¥{deal:,.0f}）。プライム会員にはセール価格でカート表示、"
+                             "非プライム（ログイン済み通常会員）には通常価格が出て「競争力のある価格」超過＝カート非表示")
+            else:
+                block.append("  原因: オファーAPIは自社カート獲得中と返すが、通常価格の着地が「競争力のある価格」を超過"
+                             "＝商品ページでカート非表示の可能性（API反映遅れ。全員落ちなら次サイクル以降「カート喪失」で毎回通知）")
+            block.append(_threshold_line(cse, own_p, own_pts))
+            block.append(f"  カート表示セグメント: {segs}"
+                         + ("（NON_PRIME なし＝通常会員にはカート無し）" if "NON_PRIME" not in (cse.get("segments") or []) else ""))
+            block.append(f"  ※この通知は{CPT_NOTIFY_INTERVAL_SEC // 3600}時間毎・解消時に✅。止めるなら管理シート「アラート除外」TRUE")
+        if cpt_resolved:
+            block.append("  しきい値超過が解消しました（着地価格が「競争力のある価格」の範囲内に戻った or しきい値解除）"
+                         + (f"：しきい値 ¥{cpt_val:,.0f} ／ 自社着地 ¥{own_p - own_pts:,.0f}"
+                            if cpt_val is not None and own_p is not None else ""))
         tail_lines = []   # 原因行の後ろに出す詳細（issue 全件・出品資格）
         # 出品 issue の全件列挙（停止/購入不可/検索対象外/消失/新規発生のいずれかで出す。最大6件）
         show_issues = bool({"自社出品消失", "購入不可", "検索対象外"} & set(issues)) or bool(issue_event)
@@ -1348,15 +1491,29 @@ def main() -> int:
         n_best += 1 if best_event else 0
         n_var += 1 if var_event else 0
         n_browse += 1 if browse_event else 0
+        n_cpt += 1 if cpt_event else 0
         time.sleep(0.6)
 
-    # 3) 自動列をシートへ書き戻し（F:L＝状態/時刻/相乗りID/ベストセラー/バリ親/ブラウズ/出品issue）
+    # 3) 自動列をシートへ書き戻し（F:N＝状態/時刻/相乗りID/ベストセラー/バリ親/ブラウズ/出品issue/しきい値/超過通知）
     if writes:
-        sheet_update(gtok, sheet_id, f"F2:L{1 + len(writes)}", writes)
+        sheet_update(gtok, sheet_id, f"F2:{LAST_COL}{1 + len(writes)}", writes)
 
-    # 3.5) Buy Box抑制ASINに「競争力のある価格」しきい値を付与（20件バッチ・該当ASINのみ）
+    # 3.5) Buy Box抑制ASINに「競争力のある価格」しきい値を付与（20件バッチ・該当ASINのみ）。
+    #      今サイクルの照会(cs)に含まれていれば再照会しない。
     if cpt_pending:
-        thr = get_competitive_thresholds(token, [a for _, a, _, _ in cpt_pending])
+        need_fetch = [a for _, a, _, _ in cpt_pending if a not in cs]
+        thr = dict(cs)
+        if need_fetch:
+            fetched = get_competitive_thresholds(token, need_fetch, own_seller)
+            thr.update(fetched)
+            # 列M 未キャッシュの ASIN で今回しきい値が取れたら個別保存（Codex P2: 保存しないと日次走査まで
+            # しきい値超過の監視対象から外れたまま＝カート復帰後の非プライム層落ちを見逃す）
+            for a, ent in fetched.items():
+                if ent.get("cpt") is not None and a in row_of:
+                    try:
+                        sheet_update(gtok, sheet_id, f"M{2 + row_of[a]}", [[f"{ent['cpt']:.0f}"]])
+                    except Exception as e:
+                        print(f"  [warn] {a}: しきい値の列M保存失敗（次の日次走査で回復）: {e}")
         for idx, a, p, pts in cpt_pending:
             problems[idx].append(_threshold_line(thr.get(a), p, pts))
 
@@ -1366,11 +1523,12 @@ def main() -> int:
                 + "\n".join("\n".join(b) for b in problems)
                 + "\n[hr]※セラー名はストアURLをクリックで確認。"
                   "カート落ち/購入不可/検索対象外は解消かミュート(管理シート「アラート除外」TRUE)まで毎回通知。"
+                  "しきい値超過(非プライム層カート喪失/カート落ち疑い)は3時間毎・解消時✅。"
                   "ベストセラー/バリエーション/ブラウズノード/出品issue(ERROR発生・WARNING予兆)は変化時のみ。"
                   "ベストセラータグ=カテゴリ1位×ノード商品数100件以上の推定。[/info]")
         chatwork_post(body)
         print(f"[alert] cart={n_cart} search={n_search} hijack={n_hijack} "
-              f"best={n_best} var={n_var} browse={n_browse} ASIN={len(problems)} 通知")
+              f"best={n_best} var={n_var} browse={n_browse} cpt={n_cpt} ASIN={len(problems)} 通知")
     else:
         print("[ok] 新規異常なし")
 
