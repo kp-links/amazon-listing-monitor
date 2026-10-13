@@ -233,6 +233,27 @@ def get_listings_item(token: str, seller: str, sku: str) -> dict | None:
     return None
 
 
+ISSUE_MSG_MAX = 110
+# Amazon 側の日本語訳に脱字がある定型文（API 原文で実測 2026-10-13: 「。 れらの項目が欠落していても」）
+_ISSUE_MSG_FIXES = (("。 れらの項目", "。これらの項目"),)
+
+
+def _issue_msg(code: str, msg: str) -> str:
+    """issue メッセージの整形。Amazon 原文の脱字補正＋定型文の圧縮＋文の途中で切らない切り詰め。"""
+    for bad, good in _ISSUE_MSG_FIXES:
+        msg = msg.replace(bad, good)
+    msg = re.sub(r"。\s+", "。", msg).strip()
+    if code == "18448":  # 定型文「重要な項目が欠けています:X。これらの項目が欠落していても…品質には影響します。」
+        m = re.search(r"欠けています[:：]\s*([^。]+)。", msg)
+        if m:
+            return f"重要項目の欠落: {m.group(1).strip()}（表示は妨げられないが品質に影響）"
+    if len(msg) > ISSUE_MSG_MAX:
+        cut = msg[:ISSUE_MSG_MAX]
+        p = cut.rfind("。")
+        msg = (cut[:p + 1] if p >= ISSUE_MSG_MAX // 2 else cut) + "…"
+    return msg
+
+
 def _issue_line(x: dict) -> str:
     """出品 issue 1件 → 通知1行。例: [ERROR] 100238 画像PT04は…（属性: main_product_image_locator｜措置: 属性のみ非表示）"""
     extra = []
@@ -241,7 +262,8 @@ def _issue_line(x: dict) -> str:
     if x.get("actions"):
         extra.append("措置: " + "/".join(ENFORCEMENT_JA.get(a, a) for a in x["actions"]))
     tail = f"（{'｜'.join(extra)}）" if extra else ""
-    return f"[{x.get('sev', '')}] {x.get('code', '')} {x.get('msg', '')[:110]}{tail}"
+    code = str(x.get("code", ""))
+    return f"[{x.get('sev', '')}] {code} {_issue_msg(code, str(x.get('msg', '')))}{tail}"
 
 
 def _issue_codes(li: dict | None) -> str:
